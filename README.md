@@ -1,13 +1,20 @@
 # MQTT 温湿度模拟终端
 
-基于 MQTT 协议的温湿度数据上报模拟终端，包含两种终端类型：
+基于 MQTT 协议的温湿度数据上报模拟终端，包含多种终端类型。
+
+另有辅助工具：`gui_sensor.py`（GUI 温湿度模拟器）、`modbus_sim_server.py`（本地 Modbus 模拟服务）、`modbus_write.py`（写入本组寄存器）、`mqtt_monitor.py`（订阅监视）。
+
+## GUI 温湿度模拟器（推荐）
+
+双击 `start_gui.bat` 启动（或命令行运行 `python gui_sensor.py`）。拖动滑块调整温湿度，松手即自动上报 MQTT 并同步写入 `data/sensor_data.json`，界面日志实时显示服务器回传的消息，无需手动编辑文件。
 
 | 终端 | 文件 | 数据来源 |
 |------|------|----------|
+| **GUI 模拟器** | `gui_sensor.py` | 图形界面拖滑块设置数值，松手即上报 |
 | 文件监听终端 | `terminal_file.py` | 手动编辑本地 JSON 文件，保存后立即上报 |
 | Modbus 采集终端 | `terminal_modbus.py` | 轮询 Modbus TCP 服务寄存器，数值变化后上报 |
 
-另有辅助工具：`modbus_sim_server.py`（本地 Modbus 模拟服务）、`modbus_write.py`（写入本组寄存器）、`mqtt_monitor.py`（订阅监视）。
+> GUI 模拟器与文件监听终端功能等价（内置上报，无需同时运行 `terminal_file.py`）；参数：`--device 设备ID`。
 
 ## MQTT 服务器
 

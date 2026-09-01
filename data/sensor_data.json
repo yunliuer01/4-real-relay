@@ -1,5 +1,4 @@
 {
-  "temperature": 26.5,
-  "humidity": 60.2,
-  "_说明": "手动修改 temperature(温度℃) 和 humidity(湿度%RH) 的数值并保存，终端会自动检测并上报"
+  "temperature": 32.51,
+  "humidity": 46.5
 }
