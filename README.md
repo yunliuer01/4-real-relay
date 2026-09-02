@@ -2,7 +2,7 @@
 
 基于 MQTT 协议的温湿度数据上报模拟终端，包含多种终端类型。
 
-另有辅助工具：`gui_sensor.py`（GUI 温湿度模拟器）、`modbus_sim_server.py`（本地 Modbus 模拟服务）、`modbus_write.py`（写入本组寄存器）、`mqtt_monitor.py`（订阅监视）。
+另有辅助工具：`gui_sensor.py`（GUI 温湿度模拟器）、`jetlinks_terminal.py`（JetLinks 平台接入，含两种适配模式与下行控制）、`jetlinks_rule.sql`（EMQX 规则转换 SQL）、`modbus_sim_server.py`（本地 Modbus 模拟服务）、`modbus_write.py`（写入本组寄存器）、`mqtt_monitor.py`（订阅监视）。
 
 ## GUI 温湿度模拟器（推荐）
 
@@ -99,6 +99,58 @@ python modbus_write.py --temp 26 --hum 58
 ```bash
 python mqtt_monitor.py                # 订阅 terminal/#，实时打印
 ```
+
+### 5. JetLinks 平台接入（EMQX → JetLinks 双适配）
+
+JetLinks 网页：`http://172.16.4.211:9000`（MQTT 接入端口仍为 9783）。
+
+#### 5.1 JetLinks 网页配置（一次性）
+
+1. **登录** JetLinks → 左侧 **设备管理 → 产品** → 新增产品：
+   - 产品名称 `MQTT温湿度终端`，产品ID 填 **`mqtt-iot`**，消息协议选 **JetLinks 官方协议**，网络协议 MQTT
+2. 进入产品 → **物模型**：
+   - 属性 `temperature`（数值型，标识 temperature，读写类型只读）
+   - 属性 `humidity`（数值型，标识 humidity，只读）
+   - 功能 `setInterval`（参数 `interval` 整数，用于设置上报间隔秒数）
+3. **设备管理 → 设备** → 新增设备：设备ID 填 **`FILE-TERM-01`**，所属产品选 `mqtt-iot`，保存后记录设备状态为"启用"
+4. 设备接入 EMQX 使用现有账号（test/123456）；JetLinks 通过主题中的产品ID/设备ID识别设备
+
+#### 5.2 两种适配路线
+
+**路线 A（不改终端，EMQX 规则转换）**：终端保持原始报文 `terminal/{deviceId}/th`，
+由 EMQX 规则引擎转换为 JetLinks 物模型格式并转发到 `/mqtt-iot/{deviceId}/properties/report`。
+规则 SQL 见 `jetlinks_rule.sql`（EMQX Dashboard → 规则引擎 → 创建规则，粘贴 SQL + Republish 动作）。
+
+```bash
+python jetlinks_terminal.py --mode emqx     # 终端侧只需加 --mode emqx
+```
+
+**路线 B（终端直接适配 JetLinks 报文）**：终端直接上报 `{"properties":{...}}` 到
+`/mqtt-iot/FILE-TERM-01/properties/report`，无需 EMQX 规则。
+
+```bash
+python jetlinks_terminal.py                 # 默认 jetlinks 模式
+```
+
+#### 5.3 平台下发控制（最终目标）
+
+终端已订阅 JetLinks 下行主题，JetLinks 网页 **设备详情 → 功能调用** 点按钮即可控制：
+
+| 平台操作 | 终端行为 |
+|---|---|
+| 功能调用 `setInterval(interval=3)` | 上报间隔改为 3 秒，回复 `{messageId, success, output}` |
+| 读取属性 | 回复当前温湿度 `{messageId, properties, success}` |
+| 修改属性 `temperature=30` | 写入本地 JSON 文件并回复，文件变化自动触发上报 |
+
+已验证的 MQTT 协议闭环（JetLinks 平台侧接入后即可直接操作）：
+```
+读取属性  -> /mqtt-iot/JL-TEST-01/properties/read/reply  {"messageId":"m-read-1","properties":{"temperature":26.3,...},"success":true}
+功能调用  -> /mqtt-iot/JL-TEST-01/function/invoke/reply   {"messageId":"m-fn-1","success":true,"output":"上报间隔已设置为 3 秒"}
+修改属性  -> /mqtt-iot/JL-TEST-01/properties/write/reply  {"messageId":"m-wr-1","success":true,"properties":{"temperature":30.0}}
+```
+
+> 注意：JetLinks 协议主题带前导斜杠（`/mqtt-iot/FILE-TERM-01/...`），与 `terminal/...` 格式不同。
+> EMQX Dashboard（18083）若无法访问，规则引擎需联系老师开通。
 
 ## 说明
 
