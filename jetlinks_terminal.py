@@ -24,9 +24,7 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
-import uuid
 
 import paho.mqtt.client as mqtt
 
@@ -63,7 +61,8 @@ class JetLinksReporter:
         self.topic_online = f"/{product_id}/{device_id}/online"
         self.topic_offline = f"/{product_id}/{device_id}/offline"
 
-        client_id = f"jetlinks-{device_id}-{uuid.uuid4().hex[:6]}"
+        # JetLinks 官方 MQTT 协议要求 clientId 必须等于设备 ID
+        client_id = device_id
         self.client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=client_id, clean_session=True)
@@ -117,8 +116,10 @@ class JetLinksReporter:
         return True
 
     def report_jetlinks(self, temperature: float, humidity: float):
-        """JetLinks 物模型报文：{"properties":{"temperature":..,"humidity":..}}"""
-        payload = {"properties": {"temperature": round(temperature, 2),
+        """JetLinks 物模型报文（MQTT Broker 接入需带 deviceId）：
+        {"deviceId":"FILE-TERM-01","properties":{"temperature":..,"humidity":..}}"""
+        payload = {"deviceId": self.device_id,
+                   "properties": {"temperature": round(temperature, 2),
                                   "humidity": round(humidity, 2)}}
         self.latest.update(payload["properties"])
         info = self.client.publish(self.topic_prop_report,
@@ -165,6 +166,7 @@ class JetLinksReporter:
         message_id = data.get("messageId", "")
         log.info("平台读取属性 -> 回复当前值")
         payload = {"messageId": message_id,
+                   "deviceId": self.device_id,
                    "properties": self.latest,
                    "success": True}
         self.client.publish(f"{self.topic_prop_read}/reply",
@@ -175,7 +177,7 @@ class JetLinksReporter:
         message_id = data.get("messageId", "")
         props = {k: float(v) for k, v in data.get("properties", {}).items()
                  if v is not None}
-        # 写入本地 JSON 文件（改变文件会触发监听上报）
+        # 写入本地 JSON 文件，由文件监听（watchdog + 周期轮询）自动触发上报
         merged = {"temperature": self.latest.get("temperature"),
                   "humidity": self.latest.get("humidity")}
         merged.update(props)
@@ -194,7 +196,9 @@ class JetLinksReporter:
                     output="", success=True, extra={"properties": props})
 
     def _reply(self, topic, message_id, output, success=True, extra=None):
-        payload = {"messageId": message_id, "success": success}
+        payload = {"messageId": message_id,
+                   "deviceId": self.device_id,
+                   "success": success}
         if output:
             payload["output"] = output
         if extra:
