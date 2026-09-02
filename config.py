@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 """全局配置：MQTT 服务器连接信息与上报格式"""
 
-# ---- MQTT 服务器 ----
+# ---- MQTT 服务器（设备接入）----
 MQTT_HOST = "172.16.4.211"
 MQTT_PORT = 9783
-MQTT_USER = "test"
+MQTT_USER = "test"          # 设备接入账号（实测有效；group5 账号不能用于 MQTT 接入）
 MQTT_PASS = "123456"
 MQTT_KEEPALIVE = 60  # 秒
+
+# ---- 平台账号（网页/管理端使用）----
+# JetLinks 平台网页登录：http://172.16.4.211:9000
+JETLINKS_WEB_USER = "admin5"
+JETLINKS_WEB_PASS = "Admin@group5"
+# EMQX Dashboard 账号（管理端 18083 当前未开放，预留）
+EMQX_ADMIN_USER = "group5"
+EMQX_ADMIN_PASS = "Admin@group5"
 
 # ---- 上报主题 ----
 # 数据主题：terminal/{device_id}/th

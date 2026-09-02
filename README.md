@@ -104,9 +104,17 @@ python mqtt_monitor.py                # 订阅 terminal/#，实时打印
 
 JetLinks 网页：`http://172.16.4.211:9000`（MQTT 接入端口仍为 9783）。
 
+**平台账号（本小组）**
+
+| 平台 | 账号 | 用途 |
+|------|------|------|
+| JetLinks 网页 | `admin5` / `Admin@group5` | 浏览器登录 9000 端口，建产品/物模型/设备 |
+| EMQX Dashboard | `group5` / `Admin@group5` | 管理端账号（18083 未开放，预留） |
+| MQTT 设备接入 | `test` / `123456` | 终端连接 9783 用（实测有效，勿用 group5） |
+
 #### 5.1 JetLinks 网页配置（一次性）
 
-1. **登录** JetLinks → 左侧 **设备管理 → 产品** → 新增产品：
+1. **登录**（admin5/Admin@group5）JetLinks → 左侧 **设备管理 → 产品** → 新增产品：
    - 产品名称 `MQTT温湿度终端`，产品ID 填 **`mqtt-iot`**，消息协议选 **JetLinks 官方协议**，网络协议 MQTT
 2. 进入产品 → **物模型**：
    - 属性 `temperature`（数值型，标识 temperature，读写类型只读）
