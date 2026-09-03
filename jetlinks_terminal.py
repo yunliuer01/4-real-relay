@@ -13,6 +13,8 @@
   - properties/read   : 平台读取属性，终端回复当前温湿度
   - properties/write  : 平台修改属性，终端写入本地文件并回复
   所有回复主题 = 原主题 + /reply，messageId 与下行一致。
+  共性要点（平台联调必做）：回复 invoke/reply 之后，终端还须主动补发一条
+  /properties/report 更新控制后的最新状态，平台运行状态才能即时刷新验证。
 
 用法：
     python jetlinks_terminal.py                                   # 默认: jetlinks 模式
@@ -24,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -76,6 +79,9 @@ class JetLinksReporter:
         # 最新属性（供 read/write 回复）
         self.latest = {"temperature": None, "humidity": None}
         self._connected = False
+        # 平台控制后的主动上报通道（默认直接走 JetLinks 物模型主题；
+        # emqx 模式下由 main() 替换为原始格式上报，走 EMQX 规则转换链路）
+        self.upstream_report = None
 
     # ---------- 连接 ----------
     def _on_connect(self, client, userdata, flags, rc, properties=None):
@@ -151,16 +157,128 @@ class JetLinksReporter:
         if function_id == "setInterval":
             seconds = int(inputs.get("interval", inputs.get("seconds", 5)))
             seconds = max(1, min(3600, seconds))
-            self.report_interval = seconds
+            self._apply_interval(seconds)
             output = f"上报间隔已设置为 {seconds} 秒"
             log.info("功能执行: %s -> %s", function_id, output)
             self._reply(f"{self.topic_func_invoke}/reply",
                         message_id, output, success=True)
+        elif function_id in ("setTH", "setTempHum", "setSensorValue"):
+            # 平台一键设置温湿度：写目标 + 回复，由文件监听(watchdog + 周期轮询)
+            # 或下一次轮询自动触发补发上报，与手动改文件同一链路
+            self._handle_set_th(message_id, inputs)
         else:
             output = f"未知功能: {function_id}"
             log.warning(output)
             self._reply(f"{self.topic_func_invoke}/reply",
                         message_id, output, success=False)
+
+    # ---------- 设备动作钩子（子类可重写以适配不同数据源：文件 / Modbus / OPC-UA ...） ----------
+    def _read_current_values(self):
+        """读取当前温度/湿度作为未填字段的兜底值。返回 (t, h)，失败返回 (None, None)。
+
+        默认实现从 data_file 读 JSON；MODBUS 子类重写为读寄存器。"""
+        if not self.data_file:
+            return (None, None)
+        try:
+            with open(self.data_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return float(d.get("temperature")), float(d.get("humidity"))
+        except Exception:
+            return (None, None)
+
+    def _apply_values(self, temperature: float, humidity: float) -> bool:
+        """把温度/湿度写入真实数据源。返回是否成功。
+
+        默认实现写 data_file；MODBUS 子类重写为写保持寄存器。"""
+        if not self.data_file:
+            return False
+        try:
+            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+            with open(self.data_file, "w", encoding="utf-8") as f:
+                json.dump({"temperature": temperature, "humidity": humidity}, f,
+                          ensure_ascii=False, indent=2)
+            log.info("平台设置温湿度 -> 已写入文件: %.2f℃ / %.2f%%RH",
+                     temperature, humidity)
+            return True
+        except OSError as e:
+            log.error("写入文件失败: %s", e)
+            return False
+
+    def _apply_interval(self, seconds: int):
+        """应用平台下发的 setInterval。默认仅更新 self.report_interval。
+
+        MODBUS 子类重写时同步修改 ModbusCollector.interval。"""
+        self.report_interval = seconds
+
+    def _handle_set_th(self, message_id, inputs):
+        """平台功能按钮设置温湿度。
+
+        做三件事：写文件 + 回复 invoke/reply + 延迟补发 properties/report。
+        - 写文件保证与手动改文件同一数据源（watchdog/轮询兜底上报）；
+        - invoke/reply 让平台显示功能执行结果；
+        - 主动 properties/report 让平台运行状态即时刷新（不依赖文件监听时序）。
+        参数可只传一个，另一个沿用文件里的当前值。
+        """
+        inputs = self._normalize_inputs(inputs)  # 防御：统一 dict 形式
+        try:
+            temp = inputs.get("temperature")
+            hum = inputs.get("humidity")
+            if temp is None and hum is None:
+                raise ValueError("至少填写 temperature 或 humidity 之一")
+            if temp is not None:
+                temp = float(temp)
+                if not (-40.0 <= temp <= 80.0):
+                    raise ValueError(f"温度 {temp} 超出范围 [-40, 80]℃")
+            if hum is not None:
+                hum = float(hum)
+                if not (0.0 <= hum <= 100.0):
+                    raise ValueError(f"湿度 {hum} 超出范围 [0, 100]%RH")
+        except (TypeError, ValueError) as e:
+            log.warning("功能执行失败: %s", e)
+            self._reply(f"{self.topic_func_invoke}/reply", message_id,
+                        output=str(e), success=False)
+            return
+        # 未填写的参数沿用当前真实值（FILE 读文件，MODBUS 读寄存器）
+        cur_t, cur_h = self._read_current_values()
+        new_temp = round(temp if temp is not None
+                         else (cur_t if cur_t is not None else 25.0), 2)
+        new_hum = round(hum if hum is not None
+                        else (cur_h if cur_h is not None else 60.0), 2)
+        file_ok = self._apply_values(new_temp, new_hum)
+        # 先回复 invoke/reply（平台据此显示功能执行结果），
+        # 再主动补发一条 properties/report 更新设备最新状态（老师提示的共性问题）。
+        # 文件监听(watchdog+轮询)或下一次 MODBUS 轮询仍作为兜底，双保险。
+        self._reply(f"{self.topic_func_invoke}/reply", message_id,
+                    output=f"OK: temperature={new_temp}, humidity={new_hum}"
+                           + ("" if file_ok else " (写入失败)"),
+                    success=file_ok)
+        if file_ok:
+            self._schedule_upstream_report(new_temp, new_hum)
+
+    def _schedule_upstream_report(self, temperature: float, humidity: float,
+                                  delay: float = 0.5):
+        """延迟补发一条属性上报。
+
+        为什么用 threading.Timer 而不是直接发：
+        - 不能在 on_message 回调里 time.sleep()（会阻塞 paho 网络线程）；
+        - 延迟 0.5s 让 invoke/reply 先落地，平台先看到功能执行成功，
+          随后立即收到 properties/report，运行状态即时刷新。
+        上报通道：
+        - jetlinks 模式 -> 直接发 /{productId}/{deviceId}/properties/report
+        - emqx 模式    -> 发原始格式 terminal/{deviceId}/th，由 EMQX 规则转换
+        """
+        target = self.upstream_report or self.report_jetlinks
+
+        def _do_report():
+            try:
+                target(temperature, humidity)
+                log.info("控制后主动上报完成: %.2f℃ / %.2f%%RH", temperature, humidity)
+            except Exception as e:
+                log.error("控制后主动上报失败: %s", e)
+
+        timer = threading.Timer(delay, _do_report)
+        timer.daemon = True
+        timer.start()
 
     def _handle_read(self, data):
         message_id = data.get("messageId", "")
@@ -177,23 +295,21 @@ class JetLinksReporter:
         message_id = data.get("messageId", "")
         props = {k: float(v) for k, v in data.get("properties", {}).items()
                  if v is not None}
-        # 写入本地 JSON 文件，由文件监听（watchdog + 周期轮询）自动触发上报
-        merged = {"temperature": self.latest.get("temperature"),
-                  "humidity": self.latest.get("humidity")}
+        # 由子类实现的"应用属性"接口（FILE 写文件，MODBUS 写寄存器）；
+        # 未填写的字段从当前真实值兜底
+        cur_t, cur_h = self._read_current_values()
+        merged = {"temperature": cur_t, "humidity": cur_h}
         merged.update(props)
         temp = merged["temperature"] if merged["temperature"] is not None else 25.0
         hum = merged["humidity"] if merged["humidity"] is not None else 60.0
-        if self.data_file:
-            try:
-                os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
-                with open(self.data_file, "w", encoding="utf-8") as f:
-                    json.dump({"temperature": temp, "humidity": hum}, f,
-                              ensure_ascii=False, indent=2)
-                log.info("平台修改属性 -> 已写入本地文件: %s", props)
-            except OSError as e:
-                log.error("写入文件失败: %s", e)
+        file_ok = self._apply_values(temp, hum)
+        if file_ok:
+            log.info("平台修改属性 -> 已应用: %s", props)
         self._reply(f"{self.topic_prop_write}/reply", message_id,
-                    output="", success=True, extra={"properties": props})
+                    output="", success=file_ok, extra={"properties": props})
+        # 与 function/invoke 同理：回复后补发最新属性，平台运行状态即时刷新
+        if file_ok:
+            self._schedule_upstream_report(temp, hum)
 
     def _reply(self, topic, message_id, output, success=True, extra=None):
         payload = {"messageId": message_id,
@@ -208,12 +324,22 @@ class JetLinksReporter:
 
     @staticmethod
     def _normalize_inputs(inputs):
-        """JetLinks inputs 可能是 {"interval":5} 或 [{"name":"interval","value":5}]"""
+        """JetLinks inputs 可能是 {"interval":5}、[{"name":"interval","value":5}]，
+        或全部参数包一层 data/params：{"data":{...}} / {"params":{...}} /
+        [{"name":"data","value":{...}}] / [{"name":"params","value":{...}}]
+        （实测：UI 走 data 包裹，REST /function/{id} 走 params 包裹）"""
         if isinstance(inputs, dict):
-            return inputs
-        if isinstance(inputs, list):
-            return {i.get("name"): i.get("value") for i in inputs if isinstance(i, dict)}
-        return {}
+            result = inputs
+        elif isinstance(inputs, list):
+            result = {i.get("name"): i.get("value") for i in inputs if isinstance(i, dict)}
+        else:
+            result = {}
+        # 兼容包一层 data 或 params 的调用形式
+        if isinstance(result.get("data"), dict):
+            result = result["data"]
+        if isinstance(result.get("params"), dict):
+            result = result["params"]
+        return result
 
 
 def main():
@@ -251,6 +377,9 @@ def main():
         orig_reporter = MqttReporter(args.device, "file", host=host, port=port,
                                      username=args.user, password=args.passwd)
         orig_reporter.start()
+        # 控制后的主动补发上报也走原始格式（terminal/{deviceId}/th），
+        # 由 EMQX 规则引擎统一转换为 JetLinks 物模型格式，链路保持一致
+        reporter.upstream_report = orig_reporter.report
 
     # 文件监听：变化即上报（复用 terminal_file 的 handler 逻辑）
     handler = SensorFileHandler(orig_reporter or reporter, file_path, 0.01)
@@ -272,8 +401,12 @@ def main():
         while True:
             time.sleep(0.5)
             # 动态读取间隔：平台 setInterval 修改后立即生效
+            # 周期轮询必须强制上报（force=True），保证平台运行状态页面"时时刻刻"都有数据，
+            # 与文件变化触发的"按阈值上报"是两条独立路径，互不干扰：
+            #   - 周期轮询：兜底刷新，让平台持续看到最新值
+            #   - watchdog回调：手动改文件时立即触发（编辑器保存抖动由300ms防抖处理）
             if time.time() >= next_report:
-                handler.read_and_report()
+                handler.read_and_report(force=True)
                 next_report = time.time() + max(1, reporter.report_interval)
     except KeyboardInterrupt:
         log.info("收到退出信号")

@@ -18,13 +18,18 @@ class MqttReporter:
 
     def __init__(self, device_id: str, device_type: str,
                  host: str = None, port: int = None,
-                 username: str = None, password: str = None):
+                 username: str = None, password: str = None,
+                 jetlinks_online: dict = None):
+        """jetlinks_online: 可选，形如 {"product_id": "mqtt-iot"}。
+        设置后连接成功会额外发布 /{product_id}/{device_id}/online 报文，
+        让 JetLinks 平台（mqtt-client-gateway 订阅 /mqtt-iot/）将该设备标记在线。"""
         self.device_id = device_id
         self.device_type = device_type
         self.host = host or config.MQTT_HOST
         self.port = port or config.MQTT_PORT
         self.username = username or config.MQTT_USER
         self.password = password or config.MQTT_PASS
+        self.jetlinks_online = jetlinks_online
 
         # client_id 加随机后缀，避免多终端相互挤掉连接
         client_id = f"{device_id}-{uuid.uuid4().hex[:6]}"
@@ -51,6 +56,13 @@ class MqttReporter:
             self._connected = True
             client.publish(config.status_topic(self.device_id),
                            "online", qos=1, retain=True)
+            if self.jetlinks_online:
+                pid = self.jetlinks_online.get("product_id")
+                topic = f"/{pid}/{self.device_id}/online"
+                client.publish(topic,
+                               json.dumps({"deviceId": self.device_id}),
+                               qos=1)
+                log.info("JetLinks 在线报文已发布 -> %s", topic)
             log.info("已连接 MQTT 服务器 %s:%s", self.host, self.port)
         else:
             log.error("MQTT 连接失败: %s", reason_code)

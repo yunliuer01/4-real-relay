@@ -11,3 +11,9 @@ venv/
 
 # 运行日志
 *.log
+
+# 平台快照/临时备份（含连接信息，勿入库）
+_*.json
+_tmp_index.js
+*_bak.py
+data/device_backup.json

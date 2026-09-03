@@ -3,8 +3,11 @@
 
 寄存器编码：高 8 位 = 温度℃，低 8 位 = 湿度%RH
 
+多小组共享 Modbus 从站约定：IP/端口各组相同，每组用自己的【组号】作从站 ID（默认已按本组=5），
+避免各组采集和设置互相冲突。写入与采集都使用同一从站 ID。
+
 用法：
-    python modbus_write.py --temp 26 --hum 58                 # 写入实验平台 0x0005
+    python modbus_write.py --temp 26 --hum 58                 # 写入实验平台 从站ID=5 寄存器 0x0005
     python modbus_write.py --temp 26 --hum 58 --host 127.0.0.1 --port 5020   # 写入本地模拟服务
 """
 import argparse
@@ -18,6 +21,7 @@ log = logging.getLogger("modbus-write")
 DEFAULT_HOST = "192.168.20.59"
 DEFAULT_PORT = 5502
 DEFAULT_REG = 0x0005
+DEFAULT_SLAVE_ID = 5          # 组号，避免各组冲突
 
 
 def parse_int(text: str) -> int:
@@ -31,7 +35,8 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST, help="Modbus 从站地址")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Modbus 从站端口")
     parser.add_argument("--reg", type=parse_int, default=DEFAULT_REG, help="寄存器地址 (默认 0x0005)")
-    parser.add_argument("--slave-id", type=int, default=1, help="从站 ID")
+    parser.add_argument("--slave-id", type=int, default=DEFAULT_SLAVE_ID,
+                        help=f"从站 ID = 组号 (默认 {DEFAULT_SLAVE_ID})")
     args = parser.parse_args()
 
     temp = int(round(args.temp))
