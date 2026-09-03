@@ -182,11 +182,11 @@ python jetlinks_terminal.py                 # 默认 jetlinks 模式
 
 ```bash
 python relay_terminal.py                    # 默认每 5s 上报
-python relay_terminal.py --interval 5 --auto-flip 30   # 每 30s 随机翻转一路(演示状态变化)
+python relay_terminal.py --interval 5       # 自定义上报间隔
 ```
 
 模拟器：8 路开关状态管理、定时/变化即时报、MQTT 自动重连、LWT 离线、
-接收 write 命令后回执并立即上报最新状态。
+接收 write 命令后回执并立即上报最新状态。状态只由平台下发的 write 命令改变，无随机翻转。
 
 ### 6.3 闭环验证（relay_e2e_verify.py 已全绿）
 

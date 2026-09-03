@@ -10,13 +10,12 @@
       -> /relay8_lfx/RELAY8-TERM-01/service/cmd           (模拟器收"写继电器"命令)
 
 功能：8 通道状态管理 + 定时上报(默认5s) + 变化立即上报 + MQTT 心跳/自动重连
-      + 接收 write 命令（全量写 8 路开关）并回复 + （可选）随机翻转模拟外部触发
-运行：python relay_terminal.py [--interval 5] [--auto-flip 0]
+      + 接收 write 命令（全量写 8 路开关）并回复
+运行：python relay_terminal.py [--interval 5]
 """
 import argparse
 import json
 import logging
-import random
 import threading
 import time
 
@@ -62,12 +61,6 @@ class RelayChannelBank:
                         changed.append(idx + 1)
         return changed
 
-    def flip_random(self):
-        """随机翻转一路（模拟外部触发/演示变化上报），返回通道号或 None"""
-        idx = random.randrange(CH_COUNT)
-        self.states[idx] = not self.states[idx]
-        return idx + 1
-
     def to_report(self):
         """上报字段：deviceId + 时间戳 + ch1_state..ch8_state"""
         payload = {"deviceId": "", "timestamp": int(time.time() * 1000)}
@@ -78,12 +71,10 @@ class RelayChannelBank:
 
 class RelaySimulator:
     def __init__(self, device_id, product_id, host=None, port=None,
-                 username=None, password=None, interval=5.0,
-                 auto_flip=0.0):
+                 username=None, password=None, interval=5.0):
         self.device_id = device_id
         self.product_id = product_id
         self.interval = max(1.0, float(interval))
-        self.auto_flip = max(0.0, float(auto_flip))  # 0 = 关闭随机翻转
         self.bank = RelayChannelBank()
         self.lock = threading.Lock()
 
@@ -217,31 +208,20 @@ class RelaySimulator:
     # ---------- 主循环 ----------
     def _auto_loop(self):
         last_report = time.time()
-        last_flip = time.time()
         while not self._stop.wait(0.5):
             now = time.time()
             if now - last_report >= self.interval:
                 last_report = now
                 if self.client.is_connected():
                     self.publish_property()
-            if self.auto_flip > 0 and now - last_flip >= self.auto_flip:
-                last_flip = now
-                with self.lock:
-                    ch = self.bank.flip_random()
-                    states = self.bank.states[:]
-                if ch:
-                    log.info("模拟外部触发: 通道%d 翻转 -> %s", ch,
-                             self.state_desc(states))
-                    self.publish_property()
 
     def start(self):
         self.client.connect_async(self._host, self._port, keepalive=60)
         self.client.loop_start()
         threading.Thread(target=self._auto_loop, daemon=True).start()
-        log.info("8路继电器模拟器已启动 设备=%s 产品=%s broker=%s:%d "
-                 "周期=%ss 随机翻转=%s", self.device_id, self.product_id,
-                 self._host, self._port, self.interval,
-                 "开" if self.auto_flip > 0 else "关")
+        log.info("8路继电器模拟器已启动 设备=%s 产品=%s broker=%s:%d 周期=%ss",
+                 self.device_id, self.product_id,
+                 self._host, self._port, self.interval)
 
     def stop(self):
         self._stop.set()
@@ -258,14 +238,12 @@ def main():
     parser.add_argument("--user", default=None)
     parser.add_argument("--passwd", default=None)
     parser.add_argument("--interval", type=float, default=5.0, help="定时上报秒数")
-    parser.add_argument("--auto-flip", type=float, default=0.0,
-                        help=">0 时每隔该秒数随机翻转一路(演示变化上报)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
     sim = RelaySimulator(args.device, args.product, args.host, args.port,
-                         args.user, args.passwd, args.interval, args.auto_flip)
+                         args.user, args.passwd, args.interval)
     try:
         sim.start()
         while True:
