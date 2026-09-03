@@ -160,6 +160,55 @@ python jetlinks_terminal.py                 # 默认 jetlinks 模式
 > 注意：JetLinks 协议主题带前导斜杠（`/mqtt-iot/FILE-TERM-01/...`），与 `terminal/...` 格式不同。
 > EMQX Dashboard（18083）若无法访问，规则引擎需联系老师开通。
 
+## 6. Day3/4 八路继电器模拟终端（命名带 -lfx，独立于温湿度资源）
+
+基于现有温湿度终端技术栈，参照已完成小组 `relay4_mt` 实现 **8 路继电器模拟终端**，
+平台资源全部以 **`relay8_lfx` / `-lfx`** 命名，**未改动**任何温湿度/共享配置。
+
+### 6.1 平台已建资源（JetLinks + EMQX）
+
+| 类型 | 资源 | 说明 |
+|------|------|------|
+| JetLinks 产品 | `relay8_lfx`（8路继电器-lfx） | 物模型 8 个属性 r1..r8（enum 1开/0关）+ 功能 `write`（8 个输入） |
+| JetLinks 设备 | `RELAY8-TERM-01`（8路继电器终端-lfx） | 绑定上述产品，plaintext 密钥同设备ID |
+| EMQX 规则 | `rule_lfx_relay8_property` (796b260a) | 设备 `property/post` → `/relay8_lfx/RELAY8-TERM-01/properties/report` |
+| EMQX 规则 | `rule_lfx_relay8_reply` (4ba0a41a) | 设备 `function/post` 回复 → `/function/invoke/reply`（JetLinks 显示执行成功） |
+| EMQX 规则 | `rule_lfx_relay8_cmd` (c883a49e) | JetLinks `/function/invoke` → 设备 `/service/cmd`（**原始透传**，见 6.3 踩坑） |
+
+创建脚本：`relay_create_product.py` / `relay_create_device.py` / `relay_create_rules.py`，
+命令规则升级与说明见 `relay_update_cmd_rule.py`。
+
+### 6.2 启动模拟器
+
+```bash
+python relay_terminal.py                    # 默认每 5s 上报
+python relay_terminal.py --interval 5 --auto-flip 30   # 每 30s 随机翻转一路(演示状态变化)
+```
+
+模拟器：8 路开关状态管理、定时/变化即时报、MQTT 自动重连、LWT 离线、
+接收 write 命令后回执并立即上报最新状态。
+
+### 6.3 闭环验证（relay_e2e_verify.py 已全绿）
+
+```
+模拟器 --property/post--> 规则A --> /properties/report --> JetLinks（设备上线，运行状态可见 r1..r8）
+JetLinks(或测试脚本) --function/invoke--> 规则C --> /service/cmd --> 模拟器执行 write
+模拟器 --function/post--> 规则B --> /function/invoke/reply --> JetLinks（执行成功）
+```
+
+JetLinks UI 演示路径：产品 `relay8_lfx` → 设备 `RELAY8-TERM-01` → **运行状态/功能调用**
+下发 `write` 即可看到 开关1..8 状态切换。
+
+```bash
+python relay_e2e_verify.py      # 端到端：设备在线 + 上行属性 + 下行 write(两种inputs格式) + 回复
+```
+
+> **踩坑记录**：本环境 EMQX 的 jq 子集仅支持对象构造类运算，`select`/`tonumber?`/`first()`
+> `//` 都会导致规则 `failed.exception`（参考组同款 jq 同样跑不通）。因此命令规则采用
+> `SELECT payload` 纯透传，由模拟器在 Python 侧解析 JetLinks 原始报文
+> （兼容 `inputs:[{name:"rN",value:1}]` 与 `inputs:[{name:"params",value:{...}}]`，
+> 也兼容标准 `/service/cmd` 的 `{id,method,params}` 格式）。
+
 ## 说明
 
 - 两个终端均带 MQTT 自动重连、遗嘱消息（异常掉线时服务器代发 offline）
