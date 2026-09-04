@@ -283,31 +283,36 @@ def mqtt_connect(cfg):
     topics = TopicManager(cfg["product_id"], cfg["device_id"], cfg.get("topic_mode", "direct"))
     print("MQTT topics base:", topics.base)
     try:
+        # umqtt.simple 要求 bytes：topic/payload/client_id 均显式编码
         c = MQTTClient(
-            cfg["device_id"],
+            cfg["device_id"].encode("utf-8"),
             cfg["mqtt_host"],
             int(cfg["mqtt_port"]),
-            user=cfg["mqtt_user"] or None,
-            password=cfg["mqtt_password"] or None,
+            user=(cfg["mqtt_user"] or "").encode("utf-8") or None,
+            password=(cfg["mqtt_password"] or "").encode("utf-8") or None,
             keepalive=MQTT_KEEPALIVE,
         )
         c.set_callback(mqtt_message)
-        c.set_last_will(topics.offline(), json.dumps({"deviceId": cfg["device_id"]}), retain=True, qos=1)
+        c.set_last_will(topics.offline().encode("utf-8"),
+                        json.dumps({"deviceId": cfg["device_id"]}).encode("utf-8"),
+                        retain=True, qos=1)
         c.connect(clean_session=True)
         if cfg.get("topic_mode", "direct") == "sys":
-            c.subscribe(topics.function_invoke_wildcard(), qos=1)
-            c.subscribe(topics.properties_read(), qos=1)
-            c.subscribe(topics.properties_write(), qos=1)
+            c.subscribe(topics.function_invoke_wildcard().encode("utf-8"), qos=1)
+            c.subscribe(topics.properties_read().encode("utf-8"), qos=1)
+            c.subscribe(topics.properties_write().encode("utf-8"), qos=1)
         else:
-            c.subscribe(topics.property_set(), qos=1)
-            c.subscribe(topics.properties_read(), qos=1)
-            c.subscribe(topics.properties_write(), qos=1)
+            c.subscribe(topics.property_set().encode("utf-8"), qos=1)
+            c.subscribe(topics.properties_read().encode("utf-8"), qos=1)
+            c.subscribe(topics.properties_write().encode("utf-8"), qos=1)
         client = c
         last_ping = now_ms()
         last_report = 0  # 连上后立即触发一次上报
         mqtt_retry = 0
         print("MQTT connected:", cfg["mqtt_host"])
-        c.publish(topics.online(), json.dumps({"deviceId": cfg["device_id"]}), retain=True, qos=1)
+        c.publish(topics.online().encode("utf-8"),
+                  json.dumps({"deviceId": cfg["device_id"]}).encode("utf-8"),
+                  retain=True, qos=1)
         publish_property(cfg)
         return True
     except Exception as e:
@@ -332,7 +337,8 @@ def publish_property(cfg, force=False):
         return
     try:
         payload = build_property_payload(cfg)
-        client.publish(topics.property_post(), json.dumps(payload), qos=1)
+        client.publish(topics.property_post().encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=1)
         print("property posted")
     except Exception as e:
         print("property post error:", e)
@@ -344,7 +350,8 @@ def publish_event(cfg, channel, state):
         return
     try:
         payload = build_event_payload(cfg, channel, state)
-        client.publish(topics.event("switch_change"), json.dumps(payload), qos=1)
+        client.publish(topics.event("switch_change").encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=1)
         print("event switch_change ch%d=%s" % (channel, state))
     except Exception as e:
         print("event post error:", e)
@@ -360,7 +367,8 @@ def publish_reply(cfg, message_id, success, output=True, function_id=None):
             reply_topic = topics.function_reply(function_id)
         else:
             reply_topic = topics.property_set_reply()
-        client.publish(reply_topic, json.dumps(payload), qos=1)
+        client.publish(reply_topic.encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=1)
     except Exception as e:
         print("reply post error:", e)
         raise
@@ -377,7 +385,8 @@ def publish_read_reply(cfg, message_id, props):
             "success": True,
             "properties": props,
         }
-        client.publish(topics.properties_read_reply(), json.dumps(payload), qos=1)
+        client.publish(topics.properties_read_reply().encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=1)
     except Exception as e:
         print("read reply error:", e)
         raise
@@ -393,7 +402,8 @@ def publish_write_reply(cfg, message_id):
             "messageId": message_id,
             "success": True,
         }
-        client.publish(topics.properties_write_reply(), json.dumps(payload), qos=1)
+        client.publish(topics.properties_write_reply().encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=1)
     except Exception as e:
         print("write reply error:", e)
         raise
@@ -402,7 +412,12 @@ def publish_write_reply(cfg, message_id):
 def mqtt_message(topic, payload):
     global client
     try:
-        msg = payload.decode("utf-8")
+        # MicroPython umqtt.simple 回调收到的是 bytes，统一解码为 str 处理
+        if isinstance(topic, bytes):
+            topic = topic.decode("utf-8")
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        msg = payload
         data = json.loads(msg)
         print("recv topic:", topic, "msg:", msg[:200])
     except Exception as e:
@@ -411,6 +426,7 @@ def mqtt_message(topic, payload):
     try:
         if topics is None:
             return
+        cfg = load_config()  # 取最新配置（模块级无全局 cfg）
         if topic == topics.property_set() and cfg.get("topic_mode", "direct") == "direct":
             # direct 模式：所有服务命令都走 /service/cmd
             handle_command(data)
@@ -585,7 +601,7 @@ def parse_form(body):
 
 
 def http_send(conn, status, body, ctype="text/html"):
-    conn.send("HTTP/1.0 %s\r\nContent-Type: %s; charset=utf-8\r\nConnection: close\r\n\r\n%s" % (status, ctype, body))
+    conn.send(("HTTP/1.0 %s\r\nContent-Type: %s; charset=utf-8\r\nConnection: close\r\n\r\n%s" % (status, ctype, body)).encode("utf-8"))
     try:
         conn.close()
     except Exception:
