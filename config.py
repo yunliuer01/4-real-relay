@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""全局配置：MQTT 服务器连接信息与上报格式"""
+"""8 路继电器项目全局配置：MQTT / JetLinks / EMQX 连接信息与产品设备 ID"""
 
 # ---- MQTT 服务器（设备接入）----
 MQTT_HOST = "172.16.4.211"
@@ -8,25 +8,22 @@ MQTT_USER = "test"          # 设备接入账号（实测有效；group5 账号�
 MQTT_PASS = "123456"
 MQTT_KEEPALIVE = 60  # 秒
 
-# ---- 平台账号（网页/管理端使用）----
-# JetLinks 平台网页登录：http://172.16.4.211:9000
+# ---- JetLinks 平台（管理端网页/API）----
+# 网页登录：http://172.16.4.211:9000
+JETLINKS_API = "http://172.16.4.211:9000/api"
 JETLINKS_WEB_USER = "admin5"
 JETLINKS_WEB_PASS = "Admin@group5"
-# EMQX Dashboard 账号（管理端 18083 当前未开放，预留）
+
+# ---- EMQX Dashboard API（规则管理）----
+EMQX_API = "http://172.16.4.211:9183/api/v5"
 EMQX_ADMIN_USER = "group5"
 EMQX_ADMIN_PASS = "Admin@group5"
 
-# ---- 上报主题 ----
-# 数据主题：terminal/{device_id}/th
-# 在线状态主题（遗嘱消息）：terminal/{device_id}/status
-def data_topic(device_id: str) -> str:
-    return f"terminal/{device_id}/th"
+# ---- 8 路继电器产品 / 设备 ----
+PRODUCT_ID = "relay8_lfx"
+DEVICE_ID = "RELAY8-TERM-01"
+RELAY_CHANNELS = 8
 
-
-def status_topic(device_id: str) -> str:
-    return f"terminal/{device_id}/status"
-
-
-# ---- 上报数据格式 ----
-# {"device_id": "...", "type": "file|modbus", "temperature": 25.3,
-#  "humidity": 60.5, "timestamp": "2026-09-01T10:00:00"}
+# ---- JetLinks mqtt 接入网关（平台内置 demo，各小组通用）----
+MQTT_PROTOCOL_ID = "2092561848730316800"     # mqtt 协议
+MQTT_ACCESS_ID = "2092562181967769600"       # mqtt接入 网关

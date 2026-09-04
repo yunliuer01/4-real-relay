@@ -1,14 +1,23 @@
 # -*- coding: utf-8 -*-
-"""Day3/4 任务：在产品 relay8_lfx 下创建 8 路继电器设备 RELAY8-TERM-01 并激活
-参考已完成的 relay4_mt 设备：configuration secureId/secureKey=设备ID, plaintext
+"""JetLinks 平台资源准备：在 8 路继电器产品下创建设备并激活
+
+产品 relay8_lfx / 设备 RELAY8-TERM-01
+参考已完成小组 relay4_mt 设备：configuration secureId/secureKey=设备ID, plaintext
+
+运行：python setup/create_device.py
 """
 import json
+import os
+import sys
 import urllib.request
 import urllib.error
 
-BASE = "http://172.16.4.211:9000/api"
-DEVICE_ID = "RELAY8-TERM-01"
-PRODUCT_ID = "relay8_lfx"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402
+
+BASE = config.JETLINKS_API
+DEVICE_ID = config.DEVICE_ID
+PRODUCT_ID = config.PRODUCT_ID
 
 
 def req(method, path, data=None, token=None, timeout=30):
@@ -26,7 +35,8 @@ def req(method, path, data=None, token=None, timeout=30):
 
 def main():
     _, r = req("POST", "/authorize/login",
-               {"username": "admin5", "password": "Admin@group5"})
+               {"username": config.JETLINKS_WEB_USER,
+                "password": config.JETLINKS_WEB_PASS})
     token = r["result"]["token"]
     print("登录 OK")
 
@@ -49,7 +59,10 @@ def main():
         "name": "8路继电器终端-lfx",
         "productId": PRODUCT_ID,
         "productName": "8路继电器-lfx",
-        "describe": "Day3/4 8路继电器模拟器：EMQX 规则转换 /relay8_lfx/{deviceId}/property/post -> properties/report，支持 write 功能控制",
+        "describe": "8路继电器模拟器(对齐 demo 完整物模型)：34 属性上报(状态/电压/电流/"
+                    "功率/温湿度)、switch_change 事件、set_channel/switch_all 控制，"
+                    f"EMQX 规则转换 /{PRODUCT_ID}/{{deviceId}}/property/post -> "
+                    "properties/report",
         "deviceType": {"value": "device", "text": "直连设备"},
         "configuration": {"secureId": DEVICE_ID, "secureKey": DEVICE_ID,
                           "secureType": "plaintext"},

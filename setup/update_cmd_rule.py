@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把 rule_lfx_relay8_cmd 更新为"原始透传"（本组最终采用的实现）。
+"""EMQX 规则维护：把 rule_lfx_relay8_cmd 原位更新为"原始透传"
 
 背景（踩坑记录）：
   JetLinks --/relay8_lfx/+/function/invoke--> 本规则 -> /relay8_lfx/RELAY8-TERM-01/service/cmd
@@ -8,19 +8,26 @@
   规则命中后全部 failed.exception（failed=1, passed=0）。
   上行属性/回复规则只用"对象构造"类 jq 所以正常。
 
-  结论：命令规则退化为 SELECT payload 纯透传，由模拟器 relay_terminal.py
+  结论：命令规则退化为 SELECT payload 纯透传，由模拟器 core/simulator.py
   在 Python 侧解析 JetLinks 原始报文（messageId/functionId/inputs），
   同时也兼容标准 /service/cmd {id,method,params} 格式。
 用 PUT /rules/{id} 原位更新。
+
+运行：python setup/update_cmd_rule.py
 """
 import json
+import os
+import sys
 import urllib.request
 import urllib.error
 
-BASE = "http://172.16.4.211:9183/api/v5"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402
+
+BASE = config.EMQX_API
 RULE_ID = "c883a49e"
-DEVICE = "RELAY8-TERM-01"
-PRODUCT = "relay8_lfx"
+DEVICE = config.DEVICE_ID
+PRODUCT = config.PRODUCT_ID
 
 
 def req(url, headers=None, data=None, method=None, timeout=30):
@@ -37,11 +44,14 @@ def req(url, headers=None, data=None, method=None, timeout=30):
             return e.code, json.loads(e.read().decode("utf-8", "replace"))
         except Exception:
             return e.code, {}
+    except Exception as e:
+        return -1, {"exc": str(e)[:100]}
 
 
 def main():
     st, b = req(BASE + "/login", headers={"Content-Type": "application/json"},
-                data={"username": "group5", "password": "Admin@group5"})
+                data={"username": config.EMQX_ADMIN_USER,
+                      "password": config.EMQX_ADMIN_PASS})
     token = b.get("token")
     sql = f'SELECT payload AS new_payload FROM "/{PRODUCT}/+/function/invoke"'
     body = {
