@@ -2,8 +2,8 @@
 """run_sim.py —— ESP32 8路继电器固件 PC 仿真测试台
 
 用法：
-    python simtest/run_sim.py
-    python simtest/run_sim.py --no-mqtt          # 只验配网/持久化/按键
+    python firmware-simtest/run_sim.py
+    python firmware-simtest/run_sim.py --no-mqtt # 只验配网/持久化/按键
 
 流程（模拟真实设备全生命周期）：
   A. 首次启动：flash 无 config.json -> 进入 AP 配网模式
@@ -32,7 +32,9 @@ import socket as real_socket
 import time as real_time
 import paho.mqtt.client as paho
 
-FW_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "main.py"))
+# 被仿真的固件：esp32-8relay-firmware/main.py（测试台位于仓库根目录）
+FW_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "..", "esp32-8relay-firmware", "main.py"))
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 FLASH_DIR = os.path.join(SIM_DIR, "flash")
 CONFIG_NAME = "config.json"   # 固件用相对路径，运行 cwd=FLASH_DIR

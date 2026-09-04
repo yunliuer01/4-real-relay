@@ -1,7 +1,8 @@
-# PC 仿真测试台（无硬件）
+# 固件 PC 仿真测试台（无硬件）
 
-在没有 ESP32 硬件的情况下，用 Python 桩(stub)在 PC 上完整跑 `main.py` 固件逻辑，
-并且**真实连接内网 EMQX / JetLinks**，验证整条业务链路。
+在没有 ESP32 硬件的情况下，用 Python 桩(stub)在 PC 上完整跑
+`esp32-8relay-firmware/main.py` 固件逻辑，并且**真实连接内网 EMQX / JetLinks**，
+验证整条业务链路。
 
 当前实测结果：**18 / 18 全过**（A~F 六个阶段）。
 
@@ -16,10 +17,10 @@
 
 ```powershell
 # 只验证 配网/保存重启/持久化/长按回配网（不依赖 broker，任何机器可跑）
-python simtest\run_sim.py --no-mqtt
+python firmware-simtest\run_sim.py --no-mqtt
 
 # 全链路：配网 -> 连真实 EMQX -> 属性上报/下行命令/断线重连/长按回配网
-python simtest\run_sim.py
+python firmware-simtest\run_sim.py
 ```
 
 运行结束后若需人工再确认配网页，浏览器打开 <http://127.0.0.1:18080>。
@@ -40,7 +41,7 @@ python simtest\run_sim.py
 ## 目录结构
 
 ```
-simtest/
+firmware-simtest/       # 位于仓库根目录，与 esp32-8relay-firmware/ 平级
 ├── run_sim.py          # 主测试脚本（测试驱动 + 固件运行容器 + MQTT 观察端）
 ├── flash/              # 运行生成的“虚拟 flash”，已 gitignore
 └── stubs/              # MicroPython 桩，模拟真机 API
@@ -59,7 +60,7 @@ simtest/
 - **低电平吸合**：`Pin.value(0)`=导通/按下，`Pin.value(1)`=断开/松开，与继电器
   硬件语义一致；测试通过 `machine.sim_read(pin)` 断言 GPIO 电平。
 - **重启语义**：`machine.reset()` 抛 `SimReset`，由 `run_sim.py` 捕获后以全新
-  命名空间重新 exec 固件，模拟掉电重启（flash 状态保留在 `simtest/flash/`）。
+  命名空间重新 exec 固件，模拟掉电重启（flash 状态保留在 `firmware-simtest/flash/`）。
 - **网络断开**：`umqtt.simple` 桩的 `sim_down()/sim_up()` 模拟链路中断；`network`
   桩的 `sim_set_sta_ok()` 可模拟连不上 WiFi。
 
@@ -76,5 +77,5 @@ simtest/
 
 - 仿真用的设备 ID 会真实出现在 EMQX/JetLinks 上。跑测试前请确认该 ID 未被占用，
   否则会出现“顶号”相互踢下线。
-- `run_sim.py` 每次运行会删除 `simtest/flash/config.json`（模拟全新设备首启）。
+- `run_sim.py` 每次运行会删除 `firmware-simtest/flash/config.json`（模拟全新设备首启）。
 - 断线重连依赖 broker 保活/会话语义，E 阶段在 EMQX 5.x 上验证通过。
