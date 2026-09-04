@@ -13,6 +13,9 @@ venv/
 *.log
 _sim.err
 
+# WorkBuddy 工作区上下文（非项目代码）
+.workbuddy/
+
 # 平台快照/临时备份（含连接信息，勿入库）
 _*.json
 _tmp_index.js

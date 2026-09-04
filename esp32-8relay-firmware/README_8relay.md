@@ -1,13 +1,13 @@
-# 8 路继电器真实设备固件（MicroPython / ESP32-C3）
+# 4 路继电器真实设备固件（MicroPython / ESP32-C3）
 
 固件文件：`main.py`
 
 ## 功能特性
 
-- **配网模式**：长按 SW1 按键 5 秒，设备开放热点 `Relay8-Setup`（IP `192.168.4.1`），用手机/电脑连接后打开 `http://192.168.4.1` 填写参数并保存，设备自动重启联网。
+- **配网模式**：长按 SW1 按键 5 秒，设备开放热点 `Relay4-Setup`（IP `192.168.4.1`），用手机/电脑连接后打开 `http://192.168.4.1` 填写参数并保存，设备自动重启联网。
 - **参数持久化**：配置保存到板载 flash `/config.json`，掉电不丢失。
 - **正常运行模式**：连上 WiFi 后自动连接 MQTT，按 JetLinks 协议上报 34 项属性、事件、命令回复；支持断线自动重连。
-- **8 路继电器控制**：支持 `set_channel`（单路）、`switch_all`（全路），状态变化触发 `switch_change` 事件。
+- **4 路继电器控制**：支持 `set_channel`（单路）、`switch_all`（全路），状态变化触发 `switch_change` 事件。
 - **双 Topic 模式**：
   - `direct`（默认）：沿用 Day3/Day4 的 EMQX 规则路径，如 `/{productId}/{deviceId}/property/post`
   - `sys`：JetLinks MQTT 网关规范路径，如 `/sys/{productId}/{deviceId}/thing/event/property/post`
@@ -17,35 +17,59 @@
 在 `main.py` 顶部修改：
 
 ```python
-RELAY_PINS = [3, 4, 5, 7, 10, 18, 19, 20]   # 8 路继电器 GPIO，低电平吸合
-SW1_PIN = 8                                  # 配网按键 GPIO，上拉输入，按下为低电平
-LED_PIN = None                               # 状态指示灯 GPIO（不需要填 None）
+RELAY_PINS = [3, 4, 5, 7]                    # 4 路继电器 GPIO，低电平吸合（RELAY1~4）
+SW1_PIN = 10                                 # 配网按键 SW1 = IO10，上拉输入，按下为低电平
+LED_PIN = 2                                  # 状态指示灯 GPIO（IO2）
 ```
 
-> **注意**：默认引脚基于常见的 CORE-ESP32-C3 8 路继电器板，请根据你的真实原理图核对并修改。不要使用 strapping/Flash 专用引脚驱动继电器，否则可能无法正常启动。
+> **注意**：默认引脚匹配 CORE-ESP32-C3 四路继电器板背面丝印：RELAY1/IO3、RELAY2/IO4、RELAY3/IO5、RELAY4/IO7、SW1/IO10、LED/IO2。ESP32-C3 上 14-19 通常不可用（Flash/USB 专用），0/2/8/9 为 strapping 引脚，使用时应谨慎。
 
 ## 刷写步骤
 
-1. **擦除并刷 MicroPython 固件**（已提供 `固件/LOLIN_C3_MINI-20241025-v1.24.0.bin`）：
+已提供 MicroPython 固件：`esp32-8relay-firmware/LOLIN_C3_MINI-20241025-v1.24.0.bin`（ESP32-C3 v1.24.0，完整 Factory 镜像，需写入 0x0）。
+
+> 注意：`_mpy_c3_v1.24.0.bin` 是仅包含应用分区的 `.app-bin`，不能直接写入 0x0，否则会出现 `No bootable app partitions` 启动错误。
+
+### 一键刷写（推荐）
+
+用 USB 连接板子，确定串口号（设备管理器 → 端口），在仓库根目录执行：
 
 ```powershell
-python -m esptool --port COMx erase_flash
-python -m esptool --port COMx write_flash -z 0x0 "d:/esp32_test/MicroPython开发/固件/LOLIN_C3_MINI-20241025-v1.24.0.bin"
+D:\8-relay\esp32-8relay-firmware\flash_esp32.bat COMx
 ```
 
-2. **用 Thonny 连接板子**，打开 `main.py`，选择 **文件 → 另存为 → MicroPython 设备**，命名为 `main.py`。
+示例：
 
-3. **按 RST/BOOT 复位**，串口输出日志即开始运行。
+```powershell
+D:\8-relay\esp32-8relay-firmware\flash_esp32.bat COM3
+```
+
+脚本会自动：擦除 Flash → 写入 MicroPython 固件 → 上传 `main.py`。
+
+### 手动刷写
+
+```powershell
+# 1. 擦除 Flash（若无法自动进下载模式，先按住 BOOT 再按 RST，然后松开 BOOT）
+python -m esptool --port COMx --chip esp32-c3 erase_flash
+
+# 2. 写入 MicroPython 固件
+python -m esptool --port COMx --chip esp32-c3 --baud 460800 write_flash -z 0x0 "D:\8-relay\esp32-8relay-firmware\LOLIN_C3_MINI-20241025-v1.24.0.bin"
+
+# 3. 上传 main.py
+python -m mpremote connect COMx fs cp "D:\8-relay\esp32-8relay-firmware\main.py" :main.py
+```
+
+4. **按 RST 复位**，串口输出日志即开始运行。
 
 ## 首次使用流程
 
 1. 上电后若没有配置或 WiFi 连接失败，自动进入配网模式：
-   - 串口打印：`配网模式: 连接热点 Relay8-Setup，打开 http://192.168.4.1`
-   - 手机连 `Relay8-Setup`（开放无密码），浏览器打开 `http://192.168.4.1`。
+   - 串口打印：`配网模式: 连接热点 Relay4-Setup，打开 http://192.168.4.1`
+   - 手机连 `Relay4-Setup`（开放无密码），浏览器打开 `http://192.168.4.1`。
 2. 在网页中填写：
    - WiFi 名称 / 密码（2.4GHz）
    - MQTT 服务器地址 / 端口 / 账号 / 密码
-   - 产品 ID（默认 `relay8_lfx`）
+   - 产品 ID（默认 `relay4_lfx`）
    - 设备 ID（默认读取 MAC 地址，可修改）
    - 主题模式：选 `direct`（对接现有 EMQX 规则）或 `sys`
    - 上报周期（默认 5 秒）

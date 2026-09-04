@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""8 路继电器真实设备固件 v1.0 (MicroPython / ESP32-C3)
+"""4 路继电器真实设备固件 v1.0 (MicroPython / ESP32-C3)
 
 功能：
 - 配网模式：长按 SW1 5 秒进入 AP 热点，IP 192.168.4.1，Web 配置 MQTT/产品/设备参数
@@ -7,9 +7,10 @@
 - 持久化：配置写入 flash /config.json，掉电不丢失
 - 断线重连：WiFi/MQTT 均支持自动重连
 
-硬件接线（默认，请按实际板子修改 RELAY_PINS / SW1_PIN）：
-- 继电器低电平吸合：RELAY_PINS 共 8 路
-- SW1 按键：上拉输入，按下为低电平
+硬件接线（CORE-ESP32-C3 四路继电器板）：
+- 继电器低电平吸合：RELAY1=IO3, RELAY2=IO4, RELAY3=IO5, RELAY4=IO7
+- SW1 按键：IO10，上拉输入，按下为低电平（长按 5 秒进配网）
+- LED 指示灯：IO2
 """
 import json
 import network
@@ -19,10 +20,10 @@ import machine
 from machine import Pin, reset
 
 # -------------------- 硬件配置（按实际板子修改） --------------------
-RELAY_PINS = [3, 4, 5, 7, 10, 18, 19, 20]   # 8 路继电器 GPIO（低电平吸合）
-SW1_PIN = 8                                  # 配网按键 GPIO（上拉，按下低电平）
-LED_PIN = None                               # 状态指示灯 GPIO（不需要则填 None）
-AP_SSID = "Relay8-Setup"                     # 配网热点名称
+RELAY_PINS = [3, 4, 5, 7]                   # 4 路继电器 GPIO（低电平吸合）
+SW1_PIN = 10                                 # 配网按键 SW1 = IO10（上拉，按下低电平）
+LED_PIN = 2                                  # 状态指示灯 GPIO（IO2）
+AP_SSID = "Relay4-Setuplfx"                # 配网热点名称（加了 lfx 后缀避免和别人板子冲突）
 AP_IP = "192.168.4.1"
 
 # -------------------- 运行参数 --------------------
@@ -32,7 +33,7 @@ RETRY_S = 5                  # WiFi/MQTT 断线重连周期
 MQTT_KEEPALIVE = 60          # MQTT 保活
 MQTT_PING_S = 30             # 主动 PING 周期（须小于 keepalive）
 REPORT_INTERVAL_S = 5        # 属性上报周期
-CHANNEL_COUNT = 8
+CHANNEL_COUNT = 4
 
 CONFIG_PATH = "config.json"
 
@@ -43,7 +44,7 @@ DEFAULT_CONFIG = {
     "mqtt_port": 1883,
     "mqtt_user": "",
     "mqtt_password": "",
-    "product_id": "relay8_lfx",
+    "product_id": "relay4_lfx",
     "device_id": "",
     "report_interval": REPORT_INTERVAL_S,
     "topic_mode": "direct",   # "direct"=沿用 EMQX 规则路径; "sys"=JetLinks 规范 /sys/... 路径
@@ -97,7 +98,7 @@ def default_device_id():
         sta.active(False)
         return "".join("%02x" % b for b in mac)
     except Exception:
-        return "relay8"
+        return "relay4"
 
 
 def mac_str():
@@ -547,9 +548,9 @@ def handle_write_property(data):
 # -------------------- Web 配网 --------------------
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>8路继电器配置</title></head>
+<title>4路继电器配置</title></head>
 <body style="font-family:sans-serif;max-width:480px;margin:20px auto">
-<h2>8路继电器设备配置</h2>
+<h2>4路继电器设备配置</h2>
 <p>MAC: <b>{mac}</b><br>默认设备ID已按MAC生成，可修改。</p>
 <form method="POST" action="/save">
 WiFi 名称(2.4GHz):<br><input name="wifi_ssid" value="{wifi_ssid}" style="width:100%"><br><br>
