@@ -275,7 +275,8 @@ def main():
     mqtt_user = args.mqtt_user or ""
     mqtt_pass = args.mqtt_pass or ""
     if not args.no_mqtt:
-        proj_root = os.path.abspath(os.path.join(SIM_DIR, "..", ".."))
+        # 测试台位于仓库根目录（firmware-simtest/），向上 1 层即项目根（含 config.py）
+        proj_root = os.path.abspath(os.path.join(SIM_DIR, ".."))
         if proj_root not in sys.path:
             sys.path.insert(0, proj_root)
         try:
@@ -456,7 +457,10 @@ def main():
     machine.sim_write(8, 1)   # 松开
     check("F1 长按后重新进入配网(页面可访问)",
           resp3 is not None and PAGE_MARK in resp3)
-    log("HINT", "可人工浏览器打开 http://127.0.0.1:%d 验证配置页" % args.web_port)
+    # 注意：192.168.4.1 是真机 AP 地址，PC 仿真打不开；127.0.0.1 端口随测试进程结束而关闭，
+    # 需在测试运行中（A/B 或 F 阶段）打开才能看到配网页。
+    log("HINT", "配网页(PC) = http://127.0.0.1:%d（测试进程运行中可打开；进程退出即关闭；"
+                "192.168.4.1 是真机热点地址，PC 上不可用）" % args.web_port)
     if watcher is not None:
         watcher.close()
 
