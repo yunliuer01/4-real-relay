@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""run_sim.py —— ESP32 8路继电器固件 PC 仿真测试台
+"""run_sim.py —— ESP32 4路继电器固件 PC 仿真测试台（无 Modbus 版本）
 
 用法：
     python firmware-simtest/run_sim.py
@@ -38,7 +38,7 @@ FW_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)
 SIM_DIR = os.path.dirname(os.path.abspath(__file__))
 FLASH_DIR = os.path.join(SIM_DIR, "flash")
 CONFIG_NAME = "config.json"   # 固件用相对路径，运行 cwd=FLASH_DIR
-PAGE_MARK = "8路继电器".encode("utf-8")   # 配网页标题标识（bytes 不能直接写中文）
+PAGE_MARK = "4路继电器".encode("utf-8")   # 配网页标题标识（bytes 不能直接写中文）
 
 
 def log(tag, msg):
@@ -248,7 +248,7 @@ def build_save_form(cfg):
         "mqtt_port": cfg.get("mqtt_port", 1883),
         "mqtt_user": cfg.get("mqtt_user", ""),
         "mqtt_password": cfg.get("mqtt_password", ""),
-        "product_id": cfg.get("product_id", "relay8_lfx"),
+        "product_id": cfg.get("product_id", "relay4_lfx"),
         "device_id": cfg.get("device_id", ""),
         "report_interval": cfg.get("report_interval", 1),
         "topic_mode": cfg.get("topic_mode", "direct"),
@@ -257,7 +257,7 @@ def build_save_form(cfg):
 
 # -------------------- 主流程 --------------------
 def main():
-    ap = argparse.ArgumentParser(description="ESP32 8路继电器固件仿真测试")
+    ap = argparse.ArgumentParser(description="ESP32 4路继电器固件仿真测试")
     ap.add_argument("--mqtt-host", default=None)
     ap.add_argument("--mqtt-port", type=int, default=None)
     ap.add_argument("--mqtt-user", default=None)
@@ -323,7 +323,7 @@ def main():
         "mqtt_port": mqtt_port,
         "mqtt_user": mqtt_user,
         "mqtt_password": mqtt_pass,
-        "product_id": "relay8_lfx",
+        "product_id": "relay4_lfx",
         "device_id": args.device_id,
         "report_interval": 1,
         "topic_mode": "direct",
@@ -353,7 +353,7 @@ def main():
     if mqtt_on:
         # ============ C. 正常模式连接真实 EMQX ============
         log("PHASE", "C. 连WiFi(桩) -> 连真实EMQX -> 属性上报")
-        base = "/relay8_lfx/%s" % args.device_id
+        base = "/relay4_lfx/%s" % args.device_id
         watcher.subscribe(base + "/#")
 
         prop = watcher.wait_property(args.device_id, timeout_s=30)
@@ -361,16 +361,16 @@ def main():
         if prop:
             ps = prop.get("properties", {})
             n_on = sum(1 for k in ps if k.startswith("ch") and k.endswith("_state"))
-            check("C2 属性含8路通道状态", n_on == 8, "ch_state=%d" % n_on)
+            check("C2 属性含4路通道状态", n_on == 4, "ch_state=%d" % n_on)
             check("C3 属性含温度/湿度", "temperature" in ps and "humidity" in ps)
             check("C4 payload含productId/deviceId/timestamp",
-                  prop.get("deviceId") == args.device_id and prop.get("productId") == "relay8_lfx")
+                  prop.get("deviceId") == args.device_id and prop.get("productId") == "relay4_lfx")
 
         # ============ D. 下行命令闭环 ============
         log("PHASE", "D. 平台下行：写属性 + set_channel/switch_all")
         mid = "sim-msg-001"
         watcher.publish(base + "/properties/write", json.dumps({
-            "productId": "relay8_lfx", "deviceId": args.device_id,
+            "productId": "relay4_lfx", "deviceId": args.device_id,
             "messageId": mid, "properties": {"ch1_state": True}}))
         got, pl = watcher.wait_topic(base + "/properties/write/reply", timeout_s=12,
                                      predicate=lambda t, p: mid in p.decode("utf-8", "replace"))
@@ -407,8 +407,8 @@ def main():
             except Exception:
                 ok3 = False
         check("D6 switch_all回复success", ok3, pl3[:120] if pl3 else "")
-        all_off = all(machine.sim_read(p) == 1 for p in (3, 4, 5, 7, 10, 18, 19, 20))
-        check("D7 switch_all后8路全断", all_off)
+        all_off = all(machine.sim_read(p) == 1 for p in (3, 4, 5, 7))
+        check("D7 switch_all后4路全断", all_off)
 
         # ============ E. MQTT 断线重联 ============
         log("PHASE", "E. MQTT 断线重联")
@@ -442,7 +442,7 @@ def main():
             break
         real_time.sleep(0.2)
     log("SIM", "固件已处于正常模式，开始长按 SW1(按住直到配网页就绪)...")
-    machine.sim_write(8, 0)   # 按下 SW1
+    machine.sim_write(10, 0)   # 按下 SW1(IO10)
     resp3 = None
     t1 = real_time.time()
     while real_time.time() - t1 < 45:
@@ -454,7 +454,7 @@ def main():
         except Exception:
             pass
         real_time.sleep(0.5)
-    machine.sim_write(8, 1)   # 松开
+    machine.sim_write(10, 1)   # 松开
     check("F1 长按后重新进入配网(页面可访问)",
           resp3 is not None and PAGE_MARK in resp3)
     # 注意：192.168.4.1 是真机 AP 地址，PC 仿真打不开；127.0.0.1 端口随测试进程结束而关闭，

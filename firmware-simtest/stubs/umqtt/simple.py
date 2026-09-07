@@ -24,12 +24,51 @@ _CB_API = getattr(mqtt, "CallbackAPIVersion", None)
 
 # 当前是否模拟“断网”
 _blocked = False
+# 环回模式：broker 不可达时也在本地“连接成功”，上行消息记录到 _rec_msgs，
+# 下行消息由 sim_downlink 注入。用于无真实 broker 的环境跑全链路断言。
+_loopback = False
+_rec_msgs = []          # (topic_str, payload_str, retain, qos)，固件→平台 上行
+_rec_lock = threading.Lock()
 # 注意：connect() 会在持有锁的情况下调用 old.disconnect()，而 disconnect() 也要取锁，
 # 因此必须用可重入的 RLock，否则同 client_id 重建连接时会死锁。
 _lock = threading.RLock()
 _instances = []
 _by_cid = {}
 _conn_count = 0
+
+
+def sim_set_loopback(v):
+    """True：本地环回模式（不需要真实 broker）。"""
+    global _loopback
+    _loopback = bool(v)
+
+
+def sim_loopback_on():
+    return _loopback
+
+
+def sim_recv_msgs(from_index=0):
+    """取固件发布的上行消息（环回模式）：[(topic_str, payload_str), ...]"""
+    with _rec_lock:
+        return [(t, p) for (t, p, _r, _q) in _rec_msgs[from_index:]]
+
+
+def sim_msg_count():
+    with _rec_lock:
+        return len(_rec_msgs)
+
+
+def sim_downlink(topic_str, payload_str):
+    """模拟平台下行：投递给已订阅该 topic 的固件实例。返回是否投递成功。"""
+    payload_b = payload_str.encode("utf-8")
+    topic_b = topic_str.encode("utf-8")
+    with _lock:
+        for inst in list(_by_cid.values()):
+            subs = getattr(inst, "_loop_subs", None)
+            if subs is not None and topic_str in subs:
+                inst._dl_q.append((topic_b, payload_b))
+                return True
+    return False
 
 
 def sim_down():
@@ -77,6 +116,10 @@ class MQTTClient:
         self._paho = None
         self._stop_evt = threading.Event()
         self._loop_thread = None
+        self._connack_rc = None   # 真实模式：connect() 后记录 CONNACK 返回码，非 0 即认证/授权失败
+        self._loop_ok = False       # 环回模式：无需真实 paho 连接
+        self._loop_subs = None      # 环回模式：订阅的 topic 集合(str)
+        self._dl_q = []             # 环回模式：平台下行消息队列
         with _lock:
             _instances.append(self)
 
@@ -96,9 +139,6 @@ class MQTTClient:
         global _conn_count
         if _blocked:
             raise OSError("simulated network down (connect)")
-        if not _broker_reachable(self.server, self.port):
-            raise OSError("simulated connect failed (broker unreachable: %s:%s)" % (self.server, self.port))
-
         cid = self._to_str(self.client_id)
         # 断开同 client_id 的旧连接（固件重连时会 new 新对象）
         with _lock:
@@ -106,6 +146,17 @@ class MQTTClient:
             if old is not None and old is not self:
                 old.disconnect()
             _by_cid[cid] = self
+        if _loopback:
+            # 环回模式：不探测、不真连，直接“在线”
+            self._paho = None
+            self._loop_ok = True
+            self._loop_subs = set()
+            self._dl_q = []
+            with _lock:
+                _conn_count += 1
+            return
+        if not _broker_reachable(self.server, self.port):
+            raise OSError("simulated connect failed (broker unreachable: %s:%s)" % (self.server, self.port))
 
         kwargs = {}
         if _CB_API:
@@ -130,6 +181,15 @@ class MQTTClient:
             self._paho.on_disconnect = self._on_disconnect_v1
             self._paho.on_connect = self._on_connect_v1
         self._paho.connect(self.server, self.port, self.keepalive)
+        # paho 同步 connect() 返回前已处理完 CONNACK；rc!=0 表示账号/密码被拒。
+        # 不在此显式检查的话，固件会误以为“已连接”，导致 broker 消息级断言全部超时。
+        if self._connack_rc not in (None, 0):
+            try:
+                self._paho.disconnect()
+            except Exception:
+                pass
+            self._paho = None
+            raise OSError("broker refused connection (CONNACK rc=%r)" % (self._connack_rc,))
         # 不用 paho.loop_start：其 loop_stop 会 join 一个阻塞在 recv 上的线程，
         # 在断线场景下最坏要等一个 keepalive(60s)。这里用自管的 0.2s 超时投递线程，
         # 保证 disconnect/旧连接顶替时能立即退出。
@@ -154,10 +214,12 @@ class MQTTClient:
 
     # ---- paho 回调 ----
     def _on_connect_v2(self, client, userdata, flags, reason_code, properties=None):
-        pass
+        # paho 2.x: reason_code 为 ReasonCode 对象，rc=0 成功
+        rc = getattr(reason_code, "value", reason_code)
+        self._connack_rc = rc
 
     def _on_connect_v1(self, client, userdata, flags, rc):
-        pass
+        self._connack_rc = rc
 
     def _on_message_v2(self, client, userdata, msg):
         # 与真机一致：回调收到 bytes
@@ -180,6 +242,9 @@ class MQTTClient:
             raise OSError("simulated network down (subscribe)")
         if isinstance(topic, str):
             raise TypeError("umqtt topic must be bytes, got str")
+        if self._loop_ok:
+            self._loop_subs.add(self._to_str(topic))
+            return
         if self._paho is None:
             raise OSError("not connected")
         self._paho.subscribe(self._to_str(topic), qos)
@@ -191,12 +256,25 @@ class MQTTClient:
             raise TypeError("umqtt topic must be bytes, got str")
         if isinstance(msg, str):
             raise TypeError("umqtt msg must be bytes, got str")
+        if self._loop_ok:
+            with _rec_lock:
+                _rec_msgs.append((self._to_str(topic), self._to_str(msg), bool(retain), qos))
+            return
         if self._paho is None:
             raise OSError("not connected")
         self._paho.publish(self._to_str(topic), msg, qos=qos, retain=retain)
 
     def check_msg(self):
-        """paho 后台线程已投递消息，此处主要模拟断线检测。"""
+        """paho 后台线程已投递消息；环回模式由本方法从 _dl_q 拉取并回调。"""
+        if _blocked:
+            raise OSError("simulated network down (check_msg)")
+        if self._loop_ok:
+            while self._dl_q:
+                t_b, p_b = self._dl_q.pop(0)
+                if self.cb:
+                    self.cb(t_b, p_b)
+            return
+        # 非环回：paho 后台线程已投递消息，此处主要模拟断线检测。
         if _blocked:
             raise OSError("simulated network down (check_msg)")
 
@@ -221,6 +299,14 @@ class MQTTClient:
 
     def disconnect(self):
         self._stop_loop()
+        if self._loop_ok:
+            self._loop_ok = False
+            self._loop_subs = None
+            self._dl_q = []
+            with _lock:
+                if _by_cid.get(self._to_str(self.client_id)) is self:
+                    _by_cid.pop(self._to_str(self.client_id), None)
+            return
         if self._paho is not None:
             try:
                 self._paho.disconnect()
