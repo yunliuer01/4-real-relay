@@ -21,3 +21,15 @@ _*.json
 _tmp_index.js
 *_bak.py
 data/device_backup.json
+
+# 会话调试/临时产物（勿入库）
+/_*.py
+/_*.txt
+/_*.bin
+# 会话辅助（含连接信息，勿入库）
+/cfg*.py
+/cfg.json
+/inject_cfg.py
+/update_cfg.py
+/_press1.lognecho
+firmware-simtest/flash_modbus/_*.py

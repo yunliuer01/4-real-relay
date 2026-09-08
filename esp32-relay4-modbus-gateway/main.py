@@ -17,6 +17,7 @@
 - Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8
 """
 import json
+import os
 import network
 import socket
 import time
@@ -57,6 +58,10 @@ REPORT_INTERVAL_S = 5        # 属性上报周期
 CHANNEL_COUNT = 4
 
 CONFIG_PATH = "config.json"
+# 软复位后直接进 portal 的一次性标志文件：
+# STA 热切换进 AP 会因多线程同时持网络资源触发 lwIP 崩溃（Guru Meditation），
+# 改为写此标志 -> machine.reset() -> 上电干净环境（无线程）检测到标志直接进配网。
+PORTAL_FLAG = "/portal.flag"
 
 # 默认 Modbus 采集配置示例：从站 1 的 0x0000 -> temperature, 0x0001 -> humidity
 DEFAULT_MODBUS_CONFIG = {
@@ -103,10 +108,12 @@ sw_button = None           # SW Pin 对象（IO9，短按循环、长按全关�
 led = None
 wlan_sta = None
 wlan_ap = None
+_sta_was_active = False  # 本进程是否曾对 STA 调过 active(True)；portal 收尾只碰启动过的接口
 client = None
 topics = None
 mb_master = None
 _http_srv = None             # HTTP API 监听 socket 全局引用
+_http_stop = False           # HTTP API 线程退出标志（portal 切换前置 True 等线程退出）
 last_ping = 0
 last_report = 0
 mqtt_retry = 0
@@ -627,171 +634,7 @@ def handle_write_property(data):
 
 
 # -------------------- Web 配网 --------------------
-PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>4路继电器+Modbus配置</title>
-<style>
-body{{font-family:sans-serif;max-width:540px;margin:10px auto;padding:10px;background:#f5f7fa}}
-h2{{color:#333}}
-input,select{{width:100%;box-sizing:border-box;margin:2px 0;padding:4px}}
-.card{{border:1px solid #ccc;border-radius:8px;padding:10px;margin:10px 0;background:#fff}}
-.reg{{display:flex;gap:6px;align-items:center;margin:6px 0;padding:6px;border:1px solid #e0e0e0;border-radius:4px;background:#fafafa;flex-wrap:wrap}}
-.reg input{{width:70px}}
-.reg .k{{flex:1;min-width:90px}}
-.reg .v{{color:#28a745;font-weight:bold;min-width:40px}}
-.reg .lbl{{font-size:12px;color:#666;min-width:36px}}
-.btn{{padding:6px 12px;margin:4px 2px;border:0;border-radius:4px;cursor:pointer}}
-.btn-red{{background:#dc3545;color:#fff}}
-.btn-blue{{background:#007bff;color:#fff}}
-.btn-green{{background:#28a745;color:#fff}}
-.sub{{font-size:12px;color:#666;margin:2px 0}}
-</style></head>
-<body>
-<h2>4路继电器 + Modbus RTU 采集网关</h2>
-<p>MAC: <b>{mac}</b><br><span class="sub">默认设备ID已按MAC生成，可修改。</span></p>
-<form method="POST" action="/save" onsubmit="collect()">
-<h3>基础连接</h3>
-WiFi 名称(2.4GHz):<br><input name="wifi_ssid" value="{wifi_ssid}"><br><br>
-WiFi 密码:<br><input name="wifi_password" type="password" value="{wifi_password}"><br><br>
-MQTT 服务器地址:<br><input name="mqtt_host" value="{mqtt_host}"><br><br>
-MQTT 端口:<br><input name="mqtt_port" value="{mqtt_port}"><br><br>
-MQTT 账号:<br><input name="mqtt_user" value="{mqtt_user}"><br><br>
-MQTT 密码:<br><input name="mqtt_password" type="password" value="{mqtt_password}"><br><br>
-产品ID:<br><input name="product_id" value="{product_id}"><br><br>
-设备ID:<br><input name="device_id" value="{device_id}"><br><br>
-主题模式:<br>
-<select name="topic_mode">
-<option value="direct" {sel_direct}>direct（/product/device/property/post，对接现有 EMQX 规则）</option>
-<option value="sys" {sel_sys}>sys（/sys/...，JetLinks MQTT 网关规范）</option>
-</select><br><br>
-上报周期(秒):<br><input name="report_interval" value="{report_interval}"><br><br>
 
-<h3>Modbus RTU 采集配置</h3>
-<p class="sub">UART1 默认 TX=IO20 RX=IO21 DIR=IO8，波特率 9600。每个从站可挂多个寄存器，独立周期。</p>
-<div id="slaves"></div>
-<button type="button" class="btn btn-blue" onclick="addSlave()">+ 添加从站</button>
-<input type="hidden" name="modbus_json" id="modbus_json" value="{modbus_json}">
-<br><br>
-<button class="btn btn-green" style="padding:10px 24px;font-size:16px">保存并重启</button>
-</form>
-
-<script>
-let mb = JSON.parse(document.getElementById('modbus_json').value || '{{"slaves":[]}}');
-if(!mb.slaves) mb.slaves=[];
-
-function gid(prefix){{
-  return prefix + Math.random().toString(36).slice(2,7);
-}}
-
-function el(tag,cls,html){{
-  let e=document.createElement(tag);
-  if(cls)e.className=cls;
-  if(html!==undefined)e.innerHTML=html;
-  return e;
-}}
-
-function render(){{
-  let root=document.getElementById('slaves');
-  root.innerHTML='';
-  mb.slaves.forEach((s,si)=>{{
-    let c=el('div','card');
-    let h=el('div','','');
-    h.innerHTML = '从站 '+(si+1)+' 地址 <input id="sid_'+si+'" value="'+(s.slave_id||1)+'" style="width:60px"> '+
-      '<label><input type="checkbox" id="en_'+si+'" '+(s.enabled!==false?'checked':'')+'> 启用</label> '+
-      '<button type="button" class="btn btn-red" onclick="delSlave('+si+')">删除从站</button>';
-    c.appendChild(h);
-    let regs=el('div');
-    let regsList = s.registers||[];
-    regsList.forEach((r,ri)=>{{
-      let row=el('div','reg');
-      row.innerHTML =
-        '<span class="lbl">地址</span><input class="a" id="a_'+si+'_'+ri+'" value="'+(r.addr||0)+'">'+
-        '<span class="lbl">功能码</span><select class="f" id="f_'+si+'_'+ri+'"><option value="3" '+(r.func==3?'selected':'')+'>3</option><option value="4" '+(r.func==4?'selected':'')+'>4</option></select>'+
-        '<span class="lbl">key</span><input class="k" id="k_'+si+'_'+ri+'" value="'+(r.key||'')+'">'+
-        '<span class="lbl">周期ms</span><input class="p" id="p_'+si+'_'+ri+'" value="'+(r.period_ms||1000)+'">'+
-        '<span class="lbl">缩放</span><input class="s" id="s_'+si+'_'+ri+'" value="'+(r.scale!==undefined?r.scale:1)+'">'+
-        '<span class="lbl">小数位</span><input class="d" id="d_'+si+'_'+ri+'" value="'+(r.digits!==undefined?r.digits:2)+'">'+
-        '<label><input type="checkbox" id="sn_'+si+'_'+ri+'" '+(r.signed?'checked':'')+'>有符号</label>'+
-        '<span class="v" id="v_'+si+'_'+ri+'">-</span>'+
-        '<button type="button" class="btn btn-red" onclick="delReg('+si+','+ri+')">删</button>';
-      regs.appendChild(row);
-    }});
-    c.appendChild(regs);
-    let addBtn=el('button','btn btn-blue','+ 寄存器');
-    addBtn.type='button';
-    addBtn.onclick=function(){{ addReg(si); }};
-    c.appendChild(addBtn);
-    root.appendChild(c);
-  }});
-}}
-
-function addSlave(){{
-  mb.slaves.push({{slave_id:1, enabled:true, registers:[{{addr:0, func:3, key:'', period_ms:1000, scale:1, digits:2, signed:false}}]}});
-  render();
-}}
-function delSlave(i){{
-  mb.slaves.splice(i,1); render();
-}}
-function addReg(si){{
-  mb.slaves[si].registers.push({{addr:0, func:3, key:'', period_ms:1000, scale:1, digits:2, signed:false}});
-  render();
-}}
-function delReg(si,ri){{
-  mb.slaves[si].registers.splice(ri,1); render();
-}}
-
-function iv(elId){{
-  let e=document.getElementById(elId);
-  return e ? e.value : '';
-}}
-function ic(elId){{
-  let e=document.getElementById(elId);
-  return e ? e.checked : false;
-}}
-
-function collect(){{
-  let out={{slaves:[]}};
-  mb.slaves.forEach((s,si)=>{{
-    let slave={{slave_id:parseInt(iv('sid_'+si)||1), enabled:ic('en_'+si), registers:[]}};
-    let regs=s.registers||[];
-    regs.forEach((r,ri)=>{{
-      slave.registers.push({{
-        addr:parseInt(iv('a_'+si+'_'+ri)||0),
-        func:parseInt(iv('f_'+si+'_'+ri)||3),
-        key:iv('k_'+si+'_'+ri)||('reg_'+ri),
-        period_ms:parseInt(iv('p_'+si+'_'+ri)||1000),
-        scale:parseFloat(iv('s_'+si+'_'+ri)||1),
-        digits:parseInt(iv('d_'+si+'_'+ri)||2),
-        signed:ic('sn_'+si+'_'+ri)
-      }});
-    }});
-    out.slaves.push(slave);
-  }});
-  // 保留 RTU 硬件默认值
-  out.enabled=true; out.uart_id=1; out.baudrate=9600; out.tx_pin=20; out.rx_pin=21; out.dir_pin=8;
-  out.timeout_ms=500; out.retries=2; out.retry_interval_ms=500;
-  document.getElementById('modbus_json').value = JSON.stringify(out);
-}}
-
-function refreshValues(){{
-  try{{
-    fetch('/api/modbus_values').then(r=>r.json()).then(j=>{{
-      if(!j.values) return;
-      mb.slaves.forEach((s,si)=>{{
-        (s.registers||[]).forEach((r,ri)=>{{
-          let k='s'+(s.slave_id)+'_'+(r.key||'');
-          let el=document.getElementById('v_'+si+'_'+ri);
-          if(el && k in j.values) el.innerText = j.values[k];
-        }});
-      }});
-    }}).catch(e=>{{}});
-  }}catch(e){{}}
-}}
-
-render();
-setInterval(refreshValues, 2000);
-</script>
-</body></html>"""
 
 
 def unquote_plus(s):
@@ -832,7 +675,14 @@ def http_send(conn, status, body, ctype="text/html"):
 
 
 def render_page(cfg):
-    # 只填充 PAGE 模板需要的字段，避免 relay_pins/sw1_pin 这些硬件常量
+    # 读取 portal.html 配网页（v5.2 起外置为独立文件：15KB 页面字符串不再常驻
+    # RAM heap，避免挤压 WiFi 驱动内存导致 WPA2 握手失败/热切换崩溃）
+    try:
+        with open("portal.html", "r") as _f:
+            page = _f.read()
+    except Exception:
+        page = "<html><body><h2>portal.html missing on device</h2></body></html>"
+    # 只填充模板需要的字段，避免 relay_pins/sw1_pin 这些硬件常量
     # 触发 str.format "extra keyword arguments given" 让 portal 循环崩
     keys = ("wifi_ssid", "wifi_password",
             "mqtt_host", "mqtt_port", "mqtt_user", "mqtt_password",
@@ -851,7 +701,7 @@ def render_page(cfg):
     d["mac"] = mac_str()
     d["sel_direct"] = 'selected' if cfg.get("topic_mode", "direct") == "direct" else ""
     d["sel_sys"] = 'selected' if cfg.get("topic_mode", "direct") == "sys" else ""
-    return PAGE.format(**d)
+    return page.format(**d)
 
 
 def _parse_query(path):
@@ -1067,8 +917,9 @@ def start_control_http(cfg):
         pass
 
     # 全局引用监听 socket，防止 GC 在线程异常退出时回收它
-    global _http_srv
+    global _http_srv, _http_stop
     _http_srv = None
+    _http_stop = False  # 若上次 portal 切换置过 True，重启 HTTP 前必须复位
 
     def _serve():
         global _http_srv
@@ -1082,9 +933,13 @@ def start_control_http(cfg):
         except Exception as e:
             print("[HTTP API] bind error:", e)
             return
-        while True:
+        # accept 每秒超时一次，轮询 _http_stop，保证 portal 切换前能干净退出
+        srv.settimeout(1)
+        while not _http_stop:
             try:
                 conn, addr = srv.accept()
+            except OSError:
+                continue
             except Exception:
                 continue
             try:
@@ -1100,6 +955,13 @@ def start_control_http(cfg):
                     conn.close()
                 except Exception:
                     pass
+        # 被通知退出（portal 切换前）：关闭监听 socket 释放端口 80
+        try:
+            srv.close()
+        except Exception:
+            pass
+        _http_srv = None
+        print("[HTTP API] server stopped")
 
     try:
         _thread.start_new_thread(_serve, ())
@@ -1109,11 +971,44 @@ def start_control_http(cfg):
 
 
 def portal(cfg):
-    """进入 AP 配网模式"""
-    global client
+    """进入 AP 配网模式
+
+    必须在无其他线程持有网络资源时切换：STA HTTP 线程与主线程并发操作
+    lwIP 会触发 Guru Meditation (Load access fault) 崩溃重启，导致热点
+    一闪而逝。顺序：停 HTTP 线程 -> 断 MQTT -> 全关继电器 -> 停 Modbus
+    -> 关 STA -> 开 AP。
+    """
+    global client, _http_stop
+    # 1) 通知 HTTP 控制线程退出（accept 1s 超时轮询 _http_stop），释放端口 80。
+    #    注意：经 flag 软复位的干净路径此时 _http_srv 必为 None，直接跳过等待。
+    _http_stop = True
+    if _http_srv is not None:
+        try:
+            _http_srv.close()
+        except Exception:
+            pass
+        time.sleep(1.5)
+    # 2) 断开 MQTT（幂等）
     mqtt_disconnect()
+    # 3) 上电安全：继电器全部断开
     set_all_relay(False)
-    wlan_sta.active(False)
+    # 4) 停止 Modbus 采集线程
+    stop_modbus()
+    # 5) 断开并关闭 STA。只在本进程曾 active(True) 过 STA 时才触碰 esp_wifi：
+    #    干净 flag-boot / 无配置路径从未启动过 STA，直接 disconnect()/active(False)
+    #    会让 MicroPython 在未初始化的 esp_wifi 上执行原生调用，触发
+    #    Load access fault (MEPC 0x420f8b0e) Guru Meditation 硬崩溃
+    #    （try/except 拦不住硬件 fault，此前热点"一闪而逝"即因此）。
+    if _sta_was_active:
+        try:
+            wlan_sta.disconnect()
+        except Exception:
+            pass
+        time.sleep(0.3)
+        try:
+            wlan_sta.active(False)
+        except Exception:
+            pass
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
     ap.config(essid=AP_SSID, password="", authmode=network.AUTH_OPEN)
@@ -1210,18 +1105,63 @@ def portal(cfg):
 
 # -------------------- WiFi / 正常模式 --------------------
 def connect_wifi(cfg):
+    """连接 STA WiFi（状态机版）。
+
+    关键经验（v5.1 实机踩坑）：
+    1. connect() 后驱动进入 connecting(1001)，此期间再调 connect() 会报
+       "sta is connecting, return error / Wifi Internal Error" —— 这是正常
+       拒绝，不是故障，绝不能因此触发 active(False) 重启接口（在连接中
+       deinit WLAN 会 Guru Meditation 崩溃，热点/日志循环重启）。
+    2. 只在驱动空闲(IDLE=1000)时才发起 connect；connecting 时只等待。
+    3. 失败态(1002 密码错/1003 无AP/1004 连接失败)时 disconnect 重置再连。
+    """
+    import gc
+    global _sta_was_active
     wlan_sta.active(True)
-    time.sleep(2)  # 避免 Wifi Internal Error
+    _sta_was_active = True  # 记录本进程已启动过 STA（portal 收尾据此决定是否 teardown）
+    time.sleep(2)  # 等驱动就绪，避免 Internal Error
+    gc.collect()  # 回收碎片后再 connect，降低握手期内存压力
     start = now_ms()
+    issued = False  # 本次循环是否已发出 connect
+    tries = 0
     while not wlan_sta.isconnected():
-        if time.ticks_diff(now_ms(), start) > WIFI_TIMEOUT_S * 1000:
+        _now2 = now_ms()
+        if tries >= 3:
+            print("[wifi] give up after 3 tries, enter portal")
+            return False
+        if time.ticks_diff(_now2, start) > WIFI_TIMEOUT_S * 1000:
+            try:
+                print("[wifi] TIMEOUT status=%d active=%s connected=%s" % (wlan_sta.status(), wlan_sta.active(), wlan_sta.isconnected()))
+            except Exception as _e:
+                print("[wifi] TIMEOUT status print err:", _e)
             print("WiFi connect timeout")
             return False
-        try:
-            wlan_sta.connect(cfg["wifi_ssid"], cfg["wifi_password"])
-        except Exception as e:
-            print("wifi connect exception:", e)
-        for _ in range(10):
+        st = wlan_sta.status()
+        if st == 1000 and not issued:
+            # 驱动空闲 -> 发起连接（只发一次，之后交给轮询）
+            tries += 1
+            try:
+                wlan_sta.connect(cfg["wifi_ssid"], cfg["wifi_password"])
+                issued = True
+                print("[wifi] connect issued try#%d" % tries)
+            except Exception as e:
+                # 偶发 "sta is connecting" 忽略：驱动实际已在连接
+                print("[wifi] connect issue err (ignore):", e)
+                issued = True
+        elif st in (201, 202, 203, 1002, 1003, 1004):
+            # MicroPython ESP32 失败码：201=无AP 202=密码错/认证失败 203=连接失败
+            # （1002/1003/1004 为兼容保留）。断开重置后重试。
+            print("[wifi] connect fail status", st, "- reset and retry try#%d" % (tries + 1))
+            try:
+                wlan_sta.disconnect()
+            except Exception:
+                pass
+            time.sleep(2)
+            issued = False
+            start = now_ms()  # 重置完整超时预算，给每次尝试完整窗口
+            gc.collect()
+        # 短轮询等待
+        for _ in range(6):
             if wlan_sta.isconnected():
                 break
             time.sleep(0.5)
@@ -1273,7 +1213,7 @@ def stop_modbus():
 
 
 def run_normal(cfg):
-    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, sw_short_requested, mb_master
+    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, sw_short_requested, mb_master, _http_stop
     if not connect_wifi(cfg):
         return False
 
@@ -1317,14 +1257,18 @@ def run_normal(cfg):
         if long_triggered or portal_requested:
             long_triggered = False
             portal_requested = False
-            print("SW1 long press -> portal")
-            mqtt_disconnect()
-            stop_modbus()
+            print("SW1 long press -> portal (arm soft-reset flag)")
+            # STA 热切换进 AP 时，HTTP / Modbus worker 等多线程持有网络/串口资源，
+            # 与主线程并发切换 WiFi 会触发 lwIP Load access fault 崩溃（热点一闪而逝）。
+            # 规避方案：写一次性标志文件后软复位，上电在无线程的干净环境直接进 portal。
+            _http_stop = True  # 通知 HTTP 线程退出（尽力而为，复位后自然消失）
             try:
-                wlan_sta.disconnect()
-            except Exception:
-                pass
-            return False
+                with open(PORTAL_FLAG, "w") as _f:
+                    _f.write("1")
+            except Exception as _e:
+                print("[BUTTON] write portal flag err:", _e)
+            time.sleep(0.3)
+            reset()
 
         # WiFi 断线重连
         if not wlan_sta.isconnected():
@@ -1524,6 +1468,18 @@ def main():
     # 上电安全：继电器全部断开
     set_all_relay(False)
 
+    # portal 软复位标志存在（按键/HTTP 请求过配网）-> 直接进 AP 配网。
+    # 此时尚未启任何线程，干净环境进 portal 不会触发 lwIP 崩溃。
+    try:
+        os.stat(PORTAL_FLAG)
+        os.remove(PORTAL_FLAG)
+        print("[MAIN] portal flag found, enter AP portal (clean env)")
+        stop_modbus()
+        portal(cfg)
+        return
+    except OSError:
+        pass
+
     # 无配置 / 连不上 WiFi -> 进入配网
     if not cfg.get("wifi_ssid"):
         print("no wifi config, enter portal")
@@ -1534,6 +1490,7 @@ def main():
     while True:
         ok = run_normal(cfg)
         if not ok:
+            print("[MAIN] run_normal returned False -> portal fallback")
             stop_modbus()
             portal(cfg)
             return
