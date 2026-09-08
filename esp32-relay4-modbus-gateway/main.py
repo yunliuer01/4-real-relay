@@ -110,6 +110,7 @@ button_state = 1
 press_start = 0
 long_triggered = False
 short_triggered = False
+short_requested = False   # HTTP 短按请求标志（主循环消费）
 portal_requested = False  # HTTP / GPIO 共用的"请求进入 AP 配网"标志
 
 # -------------------- 工具函数 --------------------
@@ -727,7 +728,7 @@ def http_api_handler(cfg, conn):
     - GET /api/relay/all?state=0/1   → 全部控制
     - GET /api/status                → 当前 4 路状态
     - GET /api/info                  → IP/MAC/firmware/网络信息
-    - GET /api/sw1?action=short     → 触发短按（立即 publish）
+    - GET /api/sw1?action=short     → 设置短按标志，由主循环消费后 publish（线程安全）
     - GET /api/sw1?action=long       → 模拟长按（不真进 portal，安全）
     - GET /api/sw1?action=long&real=1→ 真长按（踢 STA 进 AP 配网，自负风险）
     """
@@ -777,10 +778,9 @@ def http_api_handler(cfg, conn):
         q = _parse_query(path)
         action = (q.get("action", "") or "").lower()
         if action == "short":
-            ok, err = trigger_short_press(cfg, source="HTTP")
-            payload = {"ok": ok, "action": "short", "source": "HTTP"}
-            if err:
-                payload["err"] = err
+            # 仅 set flag，主循环来 publish；HTTP 线程不直接碰 MQTT socket
+            trigger_short_press(cfg, source="HTTP")
+            payload = {"ok": True, "action": "short", "source": "HTTP", "queued": True}
             _http_json(conn, "200 OK", payload)
             return
         if action == "long":
@@ -1050,7 +1050,7 @@ def stop_modbus():
 
 
 def run_normal(cfg):
-    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, mb_master
+    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, mb_master
     if not connect_wifi(cfg):
         return False
 
@@ -1073,6 +1073,15 @@ def run_normal(cfg):
 
         # 检查 SW1 长按进配网
         handle_button(cfg)
+        # 消费短按请求：HTTP/GPIO 短按都通过 flag，主循环内调 publish 安全
+        if short_requested:
+            short_requested = False
+            print("[BUTTON] consuming short press request")
+            try:
+                publish_property(cfg)
+                print("[BUTTON] short press publish OK")
+            except Exception as e:
+                print("[BUTTON] short press publish err:", e)
         if long_triggered or portal_requested:
             long_triggered = False
             portal_requested = False
@@ -1126,18 +1135,14 @@ def run_normal(cfg):
 
 # -------------------- 按键处理 --------------------
 def trigger_short_press(cfg, source="GPIO"):
-    """短按触发：立即 publish 一次 property（不论来自 GPIO 还是 HTTP 都走这里）
+    """短按触发：仅设置标志 short_requested，主循环下次 tick 统一 publish。
 
-    返回 (ok:bool, err:str|None)
+    避免 HTTP 线程直接调 publish_property 和主循环抢 MQTT socket 引发 WiFi 崩溃。
     """
-    print("[BUTTON] short press via %s, trigger immediate publish" % source)
-    try:
-        publish_property(cfg)
-        print("[BUTTON] immediate publish OK")
-        return True, None
-    except Exception as e:
-        print("[BUTTON] immediate publish err:", e)
-        return False, str(e)
+    global short_requested
+    short_requested = True
+    print("[BUTTON] short press via %s, queued for main loop to publish" % source)
+    return True, None
 
 
 def trigger_long_press(cfg, source="GPIO", enter_portal=False):
