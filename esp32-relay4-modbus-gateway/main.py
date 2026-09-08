@@ -615,31 +615,168 @@ def handle_write_property(data):
 # -------------------- Web 配网 --------------------
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>4路继电器配置</title></head>
-<body style="font-family:sans-serif;max-width:480px;margin:20px auto">
-<h2>4路继电器设备配置</h2>
-<p>MAC: <b>{mac}</b><br>默认设备ID已按MAC生成，可修改。</p>
-<form method="POST" action="/save">
-WiFi 名称(2.4GHz):<br><input name="wifi_ssid" value="{wifi_ssid}" style="width:100%"><br><br>
-WiFi 密码:<br><input name="wifi_password" type="password" value="{wifi_password}" style="width:100%"><br><br>
-MQTT 服务器地址:<br><input name="mqtt_host" value="{mqtt_host}" style="width:100%"><br><br>
-MQTT 端口:<br><input name="mqtt_port" value="{mqtt_port}" style="width:100%"><br><br>
-MQTT 账号:<br><input name="mqtt_user" value="{mqtt_user}" style="width:100%"><br><br>
-MQTT 密码:<br><input name="mqtt_password" type="password" value="{mqtt_password}" style="width:100%"><br><br>
-产品ID:<br><input name="product_id" value="{product_id}" style="width:100%"><br><br>
-设备ID:<br><input name="device_id" value="{device_id}" style="width:100%"><br><br>
+<title>4路继电器+Modbus配置</title>
+<style>
+body{{font-family:sans-serif;max-width:540px;margin:10px auto;padding:10px;background:#f5f7fa}}
+h2{{color:#333}}
+input,select{{width:100%;box-sizing:border-box;margin:2px 0;padding:4px}}
+.card{{border:1px solid #ccc;border-radius:8px;padding:10px;margin:10px 0;background:#fff}}
+.reg{{display:flex;gap:6px;align-items:center;margin:6px 0;padding:6px;border:1px solid #e0e0e0;border-radius:4px;background:#fafafa;flex-wrap:wrap}}
+.reg input{{width:70px}}
+.reg .k{{flex:1;min-width:90px}}
+.reg .v{{color:#28a745;font-weight:bold;min-width:40px}}
+.reg .lbl{{font-size:12px;color:#666;min-width:36px}}
+.btn{{padding:6px 12px;margin:4px 2px;border:0;border-radius:4px;cursor:pointer}}
+.btn-red{{background:#dc3545;color:#fff}}
+.btn-blue{{background:#007bff;color:#fff}}
+.btn-green{{background:#28a745;color:#fff}}
+.sub{{font-size:12px;color:#666;margin:2px 0}}
+</style></head>
+<body>
+<h2>4路继电器 + Modbus RTU 采集网关</h2>
+<p>MAC: <b>{mac}</b><br><span class="sub">默认设备ID已按MAC生成，可修改。</span></p>
+<form method="POST" action="/save" onsubmit="collect()">
+<h3>基础连接</h3>
+WiFi 名称(2.4GHz):<br><input name="wifi_ssid" value="{wifi_ssid}"><br><br>
+WiFi 密码:<br><input name="wifi_password" type="password" value="{wifi_password}"><br><br>
+MQTT 服务器地址:<br><input name="mqtt_host" value="{mqtt_host}"><br><br>
+MQTT 端口:<br><input name="mqtt_port" value="{mqtt_port}"><br><br>
+MQTT 账号:<br><input name="mqtt_user" value="{mqtt_user}"><br><br>
+MQTT 密码:<br><input name="mqtt_password" type="password" value="{mqtt_password}"><br><br>
+产品ID:<br><input name="product_id" value="{product_id}"><br><br>
+设备ID:<br><input name="device_id" value="{device_id}"><br><br>
 主题模式:<br>
-<select name="topic_mode" style="width:100%">
+<select name="topic_mode">
 <option value="direct" {sel_direct}>direct（/product/device/property/post，对接现有 EMQX 规则）</option>
 <option value="sys" {sel_sys}>sys（/sys/...，JetLinks MQTT 网关规范）</option>
 </select><br><br>
-上报周期(秒):<br><input name="report_interval" value="{report_interval}" style="width:100%"><br><br>
-<hr>
-<h3>Modbus RTU 采集网关配置</h3>
-<p style="color:#666;font-size:12px">下方填写 JSON，示例：采集从站1的 0x0000(temperature)、0x0001(humidity)，周期 1000ms</p>
-<textarea name="modbus_json" rows="14" style="width:100%;font-family:monospace;font-size:12px">{modbus_json}</textarea><br><br>
-<button style="padding:10px 24px;font-size:16px">保存并重启</button>
+上报周期(秒):<br><input name="report_interval" value="{report_interval}"><br><br>
+
+<h3>Modbus RTU 采集配置</h3>
+<p class="sub">UART1 默认 TX=IO20 RX=IO21 DIR=IO8，波特率 9600。每个从站可挂多个寄存器，独立周期。</p>
+<div id="slaves"></div>
+<button type="button" class="btn btn-blue" onclick="addSlave()">+ 添加从站</button>
+<input type="hidden" name="modbus_json" id="modbus_json" value="{modbus_json}">
+<br><br>
+<button class="btn btn-green" style="padding:10px 24px;font-size:16px">保存并重启</button>
 </form>
+
+<script>
+let mb = JSON.parse(document.getElementById('modbus_json').value || '{{"slaves":[]}}');
+if(!mb.slaves) mb.slaves=[];
+
+function gid(prefix){{
+  return prefix + Math.random().toString(36).slice(2,7);
+}}
+
+function el(tag,cls,html){{
+  let e=document.createElement(tag);
+  if(cls)e.className=cls;
+  if(html!==undefined)e.innerHTML=html;
+  return e;
+}}
+
+function render(){{
+  let root=document.getElementById('slaves');
+  root.innerHTML='';
+  mb.slaves.forEach((s,si)=>{{
+    let c=el('div','card');
+    let h=el('div','','');
+    h.innerHTML = '从站 '+(si+1)+' 地址 <input id="sid_'+si+'" value="'+(s.slave_id||1)+'" style="width:60px"> '+
+      '<label><input type="checkbox" id="en_'+si+'" '+(s.enabled!==false?'checked':'')+'> 启用</label> '+
+      '<button type="button" class="btn btn-red" onclick="delSlave('+si+')">删除从站</button>';
+    c.appendChild(h);
+    let regs=el('div');
+    let regsList = s.registers||[];
+    regsList.forEach((r,ri)=>{{
+      let row=el('div','reg');
+      row.innerHTML =
+        '<span class="lbl">地址</span><input class="a" id="a_'+si+'_'+ri+'" value="'+(r.addr||0)+'">'+
+        '<span class="lbl">功能码</span><select class="f" id="f_'+si+'_'+ri+'"><option value="3" '+(r.func==3?'selected':'')+'>3</option><option value="4" '+(r.func==4?'selected':'')+'>4</option></select>'+
+        '<span class="lbl">key</span><input class="k" id="k_'+si+'_'+ri+'" value="'+(r.key||'')+'">'+
+        '<span class="lbl">周期ms</span><input class="p" id="p_'+si+'_'+ri+'" value="'+(r.period_ms||1000)+'">'+
+        '<span class="lbl">缩放</span><input class="s" id="s_'+si+'_'+ri+'" value="'+(r.scale!==undefined?r.scale:1)+'">'+
+        '<span class="lbl">小数位</span><input class="d" id="d_'+si+'_'+ri+'" value="'+(r.digits!==undefined?r.digits:2)+'">'+
+        '<label><input type="checkbox" id="sn_'+si+'_'+ri+'" '+(r.signed?'checked':'')+'>有符号</label>'+
+        '<span class="v" id="v_'+si+'_'+ri+'">-</span>'+
+        '<button type="button" class="btn btn-red" onclick="delReg('+si+','+ri+')">删</button>';
+      regs.appendChild(row);
+    }});
+    c.appendChild(regs);
+    let addBtn=el('button','btn btn-blue','+ 寄存器');
+    addBtn.type='button';
+    addBtn.onclick=function(){{ addReg(si); }};
+    c.appendChild(addBtn);
+    root.appendChild(c);
+  }});
+}}
+
+function addSlave(){{
+  mb.slaves.push({{slave_id:1, enabled:true, registers:[{{addr:0, func:3, key:'', period_ms:1000, scale:1, digits:2, signed:false}}]}});
+  render();
+}}
+function delSlave(i){{
+  mb.slaves.splice(i,1); render();
+}}
+function addReg(si){{
+  mb.slaves[si].registers.push({{addr:0, func:3, key:'', period_ms:1000, scale:1, digits:2, signed:false}});
+  render();
+}}
+function delReg(si,ri){{
+  mb.slaves[si].registers.splice(ri,1); render();
+}}
+
+function iv(elId){{
+  let e=document.getElementById(elId);
+  return e ? e.value : '';
+}}
+function ic(elId){{
+  let e=document.getElementById(elId);
+  return e ? e.checked : false;
+}}
+
+function collect(){{
+  let out={{slaves:[]}};
+  mb.slaves.forEach((s,si)=>{{
+    let slave={{slave_id:parseInt(iv('sid_'+si)||1), enabled:ic('en_'+si), registers:[]}};
+    let regs=s.registers||[];
+    regs.forEach((r,ri)=>{{
+      slave.registers.push({{
+        addr:parseInt(iv('a_'+si+'_'+ri)||0),
+        func:parseInt(iv('f_'+si+'_'+ri)||3),
+        key:iv('k_'+si+'_'+ri)||('reg_'+ri),
+        period_ms:parseInt(iv('p_'+si+'_'+ri)||1000),
+        scale:parseFloat(iv('s_'+si+'_'+ri)||1),
+        digits:parseInt(iv('d_'+si+'_'+ri)||2),
+        signed:ic('sn_'+si+'_'+ri)
+      }});
+    }});
+    out.slaves.push(slave);
+  }});
+  // 保留 RTU 硬件默认值
+  out.enabled=true; out.uart_id=1; out.baudrate=9600; out.tx_pin=20; out.rx_pin=21; out.dir_pin=8;
+  out.timeout_ms=500; out.retries=2; out.retry_interval_ms=500;
+  document.getElementById('modbus_json').value = JSON.stringify(out);
+}}
+
+function refreshValues(){{
+  try{{
+    fetch('/api/modbus_values').then(r=>r.json()).then(j=>{{
+      if(!j.values) return;
+      mb.slaves.forEach((s,si)=>{{
+        (s.registers||[]).forEach((r,ri)=>{{
+          let k='s'+(s.slave_id)+'_'+(r.key||'');
+          let el=document.getElementById('v_'+si+'_'+ri);
+          if(el && k in j.values) el.innerText = j.values[k];
+        }});
+      }});
+    }}).catch(e=>{{}});
+  }}catch(e){{}}
+}}
+
+render();
+setInterval(refreshValues, 2000);
+</script>
 </body></html>"""
 
 
@@ -692,9 +829,11 @@ def render_page(cfg):
         d[k] = str(v).replace('"', "&quot;")
     # MicroPython json.dumps 不支持 ensure_ascii 参数（CPython 有）
     try:
-        d["modbus_json"] = json.dumps(cfg.get("modbus", DEFAULT_MODBUS_CONFIG))
+        mb_json = json.dumps(cfg.get("modbus", DEFAULT_MODBUS_CONFIG))
     except Exception:
-        d["modbus_json"] = json.dumps(DEFAULT_MODBUS_CONFIG)
+        mb_json = json.dumps(DEFAULT_MODBUS_CONFIG)
+    # 作为 hidden input 的 value 属性，需要转义双引号避免 HTML 属性截断
+    d["modbus_json"] = mb_json.replace('"', "&quot;")
     d["mac"] = mac_str()
     d["sel_direct"] = 'selected' if cfg.get("topic_mode", "direct") == "direct" else ""
     d["sel_sys"] = 'selected' if cfg.get("topic_mode", "direct") == "sys" else ""
@@ -731,6 +870,7 @@ def http_api_handler(cfg, conn):
     - GET /api/sw1?action=short     → 设置短按标志，由主循环消费后 publish（线程安全）
     - GET /api/sw1?action=long       → 模拟长按（不真进 portal，安全）
     - GET /api/sw1?action=long&real=1→ 真长按（踢 STA 进 AP 配网，自负风险）
+    - GET /api/modbus_values         → 当前 Modbus 采集实时值
     """
     try:
         head, _, rest = _read_request(conn)
@@ -834,7 +974,17 @@ def http_api_handler(cfg, conn):
                        {"ok": False, "err": str(e)})
             return
 
-    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short)")
+    if path == "/api/modbus_values":
+        values = {}
+        if mb_master is not None:
+            try:
+                values = mb_master.get_values()
+            except Exception as e:
+                print("[HTTP API] get_values err:", e)
+        _http_json(conn, "200 OK", {"ok": True, "values": values})
+        return
+
+    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short /api/modbus_values)")
 
 
 def _read_request(conn):
@@ -990,6 +1140,10 @@ def portal(cfg):
             http_send(conn, "200 OK", "已保存，设备将在 1 秒后重启并联网。若 30 秒连不上 WiFi 会重新进入配网热点。")
             time.sleep(1)
             reset()
+        elif method == "GET" and path == "/api/modbus_values":
+            # 配网模式下 Modbus 线程未启动，返回空值即可
+            body = json.dumps({"ok": True, "values": {}})
+            http_send(conn, "200 OK", body, "application/json")
         else:
             http_send(conn, "404 Not Found", "404")
 
