@@ -40,7 +40,7 @@ except ImportError:
 
 # -------------------- 硬件配置（按实际板子修改） --------------------
 RELAY_PINS = [3, 4, 5, 7]                   # 4 路继电器 GPIO（低电平吸合）
-SW1_PIN = 3                                  # LOLIN C3 MINI 上 GPIO9 是板载 BOOT 按钮（按下会触发 ESP32-C3 复位，不能当 SW1）；改用 MISO=GPIO3 外接按键到 GND
+SW1_PIN = None                              # 见头注释：板上 GPIO3=RELAY1, GPIO9=strapping 都无法兼做按钮，先禁用 GPIO 短按，仅 HTTP 触发
 LED_PIN = 2                                  # 状态指示灯 GPIO（IO2）
 AP_SSID = "Relay4-Setuplfx"                # 配网热点名称（加了 lfx 后缀避免和别人板子冲突）
 AP_IP = "192.168.4.1"
@@ -912,12 +912,21 @@ def portal(cfg):
     except Exception:
         pass
     print("配网模式: 连接热点 %s，打开 http://%s" % (AP_SSID, AP_IP))
+    # 等 STA HTTP server 线程释放 80 端口；之前直接 bind 会撞 EADDRINUSE 致命错
+    time.sleep(1)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind(("0.0.0.0", 80))
-    except Exception as e:
-        print("bind error:", e)
+    bound = False
+    for attempt in range(5):
+        try:
+            srv.bind(("0.0.0.0", 80))
+            bound = True
+            break
+        except OSError as e:
+            print("portal bind retry %d: %s" % (attempt + 1, e))
+            time.sleep(1)
+    if not bound:
+        print("portal bind failed after retries")
         time.sleep(1)
         reset()
     srv.listen(2)
@@ -1161,12 +1170,16 @@ def trigger_long_press(cfg, source="GPIO", enter_portal=False):
 
 
 def handle_button(cfg):
-    """SW1 按键：
-    - 短按（按下后 < LONG_PRESS_MS 释放） → trigger_short_press()
+    """SW1 按键（仅 GPIO 路径，HTTP 走 trigger_short_press/trigger_long_press）：
+    - 短按（按下后 < LONG_PRESS_MS 释放） → trigger_short_press()（设 flag 由主循环 publish）
     - 长按（持续 >= LONG_PRESS_MS） → 设 long_triggered=True，run_normal 进入 portal
-    按键的"业务动作"在 trigger_xxx 里，HTTP handler 也复用。
+
+    当 button 引脚未配置（SW1_PIN=None）时，整个函数退化为 no-op；
+    HTTP 路径不受影响，仍可触发按钮语义。
     """
     global button_state, press_start, long_triggered, short_triggered
+    if button is None:
+        return
     st = button.value()
     now = now_ms()
     if st == 0 and button_state == 1:
@@ -1198,8 +1211,14 @@ def main():
 
     # 初始化硬件
     init_relays(cfg.get("relay_pins"))
-    sw1 = int(cfg.get("sw1_pin", SW1_PIN))
-    button = Pin(sw1, Pin.IN, Pin.PULL_UP)
+    sw1 = cfg.get("sw1_pin", SW1_PIN)
+    # sw1 可能为 None（无杜邦线 / 板载按钮与此固件冲突），禁用 GPIO 短按路径
+    global button
+    if sw1 is None:
+        button = None
+        print("[MAIN] SW1_PIN disabled, GPIO button inactive (HTTP only)")
+    else:
+        button = Pin(int(sw1), Pin.IN, Pin.PULL_UP)
     if LED_PIN is not None:
         led = Pin(LED_PIN, Pin.OUT, value=1)  # 熄灭（假设低电平亮）
 
