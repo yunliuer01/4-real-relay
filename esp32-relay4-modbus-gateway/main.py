@@ -11,8 +11,8 @@
 
 硬件接线（CORE-ESP32-C3 四路继电器板）：
 - 继电器低电平吸合：RELAY1=IO3, RELAY2=IO4, RELAY3=IO5, RELAY4=IO7
-- SW1 按键：默认 GPIO3（MISO），上拉输入，按下为低电平（长按 5 秒进配网）
-  - 板上 BOOT 按钮在 GPIO9（strapping pin），按下复位芯片，不能当 SW1
+- SW1 按键：IO10，上拉输入，按下为低电平（长按 5 秒进配网）
+- SW 按键：IO9（板上 BOOT 按钮同脚；运行时为普通 GPIO 可作按钮用，注意 boot 期间按下会进 download mode）
 - LED 指示灯：IO2
 - Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8
 """
@@ -40,7 +40,8 @@ except ImportError:
 
 # -------------------- 硬件配置（按实际板子修改） --------------------
 RELAY_PINS = [3, 4, 5, 7]                   # 4 路继电器 GPIO（低电平吸合）
-SW1_PIN = None                              # 见头注释：板上 GPIO3=RELAY1, GPIO9=strapping 都无法兼做按钮，先禁用 GPIO 短按，仅 HTTP 触发
+SW1_PIN = 10                                # SW1 按键 = IO10（作业规格：长按 5 秒进配网）
+SW_PIN = 9                                  # SW 按键 = IO9（板上 BOOT 按钮同脚；运行时为普通 GPIO，短按循环继电器、长按全部关闭）
 LED_PIN = 2                                  # 状态指示灯 GPIO（IO2）
 AP_SSID = "Relay4-Setuplfx"                # 配网热点名称（加了 lfx 后缀避免和别人板子冲突）
 AP_IP = "192.168.4.1"
@@ -48,6 +49,7 @@ AP_IP = "192.168.4.1"
 # -------------------- 运行参数 --------------------
 WIFI_TIMEOUT_S = 30          # 上电连 WiFi 超时时间
 LONG_PRESS_MS = 5000         # 长按 SW1 进入配网模式时间
+SW_LONG_PRESS_MS = 3000      # 长按 SW 时间（全关所有继电器）
 RETRY_S = 5                  # WiFi/MQTT 断线重连周期
 MQTT_KEEPALIVE = 60          # MQTT 保活
 MQTT_PING_S = 30             # 主动 PING 周期（须小于 keepalive）
@@ -90,12 +92,14 @@ DEFAULT_CONFIG = {
     "topic_mode": "direct",   # "direct"=沿用 EMQX 规则路径; "sys"=JetLinks 规范 /sys/... 路径
     "relay_pins": RELAY_PINS,
     "sw1_pin": SW1_PIN,
+    "sw_pin": SW_PIN,
     "modbus": DEFAULT_MODBUS_CONFIG,
 }
 
 # -------------------- 全局对象 --------------------
 relays = []
-button = None
+button = None              # SW1 Pin 对象（IO10，长按 5 秒进配网）
+sw_button = None           # SW Pin 对象（IO9，短按循环、长按全关）
 led = None
 wlan_sta = None
 wlan_ap = None
@@ -112,6 +116,15 @@ long_triggered = False
 short_triggered = False
 short_requested = False   # HTTP 短按请求标志（主循环消费）
 portal_requested = False  # HTTP / GPIO 共用的"请求进入 AP 配网"标志
+
+# SW（IO9）按键状态
+sw_button_state = 1
+sw_press_start = 0
+sw_long_triggered = False
+sw_short_triggered = False
+sw_short_requested = False  # SW 短按触发后请求立即 publish
+sw_cycle_idx = 0            # SW 短按循环计数器：0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=全关, 然后回到 0
+SW_CYCLE = [0, 1, 2, 3, "all"]  # SW 短按循环目标
 
 # -------------------- 工具函数 --------------------
 def load_config():
@@ -870,6 +883,8 @@ def http_api_handler(cfg, conn):
     - GET /api/sw1?action=short     → 设置短按标志，由主循环消费后 publish（线程安全）
     - GET /api/sw1?action=long       → 模拟长按（不真进 portal，安全）
     - GET /api/sw1?action=long&real=1→ 真长按（踢 STA 进 AP 配网，自负风险）
+    - GET /api/sw?action=short       → SW 短按：循环切换下一路继电器（CH1→CH2→CH3→CH4→全关）
+    - GET /api/sw?action=long        → SW 长按：全部关闭，cycle 重置
     - GET /api/modbus_values         → 当前 Modbus 采集实时值
     """
     try:
@@ -903,6 +918,9 @@ def http_api_handler(cfg, conn):
             "mac": mac_str(),
             "wifi_connected": False,
             "ip": "",
+            "sw1_pin": cfg.get("sw1_pin"),
+            "sw_pin": cfg.get("sw_pin"),
+            "sw_cycle_idx": sw_cycle_idx,
         }
         try:
             if wlan_sta and wlan_sta.isconnected():
@@ -974,6 +992,34 @@ def http_api_handler(cfg, conn):
                        {"ok": False, "err": str(e)})
             return
 
+    if path == "/api/sw" or path.startswith("/api/sw?"):
+        # SW (IO9) 短按/长按：短按循环切换继电器，长按全关
+        q = _parse_query(path)
+        action = (q.get("action", "") or "").lower()
+        if action == "short":
+            ok, err = trigger_sw_short(cfg, source="HTTP")
+            payload = {
+                "ok": ok, "action": "short", "source": "HTTP",
+                "queued": True,
+                "cycle_idx": sw_cycle_idx,
+            }
+            if err:
+                payload["err"] = err
+            _http_json(conn, "200 OK", payload)
+            return
+        if action == "long":
+            trigger_sw_long(cfg, source="HTTP")
+            payload = {
+                "ok": True, "action": "long", "source": "HTTP",
+                "queued": True,
+                "cycle_reset_to": 0,
+            }
+            _http_json(conn, "200 OK", payload)
+            return
+        _http_json(conn, "400 Bad Request",
+                   {"ok": False, "err": "need ?action=short|long"})
+        return
+
     if path == "/api/modbus_values":
         values = {}
         if mb_master is not None:
@@ -984,7 +1030,7 @@ def http_api_handler(cfg, conn):
         _http_json(conn, "200 OK", {"ok": True, "values": values})
         return
 
-    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short /api/modbus_values)")
+    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short /api/sw?action=short /api/modbus_values)")
 
 
 def _read_request(conn):
@@ -1213,7 +1259,7 @@ def stop_modbus():
 
 
 def run_normal(cfg):
-    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, mb_master
+    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, sw_short_requested, mb_master
     if not connect_wifi(cfg):
         return False
 
@@ -1234,17 +1280,26 @@ def run_normal(cfg):
     while True:
         now = now_ms()
 
-        # 检查 SW1 长按进配网
+        # 检查 SW1 / SW 按键
         handle_button(cfg)
+        handle_sw_button(cfg)
         # 消费短按请求：HTTP/GPIO 短按都通过 flag，主循环内调 publish 安全
         if short_requested:
             short_requested = False
-            print("[BUTTON] consuming short press request")
+            print("[BUTTON] consuming SW1 short press request")
             try:
                 publish_property(cfg)
-                print("[BUTTON] short press publish OK")
+                print("[BUTTON] SW1 short press publish OK")
             except Exception as e:
-                print("[BUTTON] short press publish err:", e)
+                print("[BUTTON] SW1 short press publish err:", e)
+        if sw_short_requested:
+            sw_short_requested = False
+            print("[SW] consuming SW short press publish request")
+            try:
+                publish_property(cfg)
+                print("[SW] SW short press publish OK")
+            except Exception as e:
+                print("[SW] SW short press publish err:", e)
         if long_triggered or portal_requested:
             long_triggered = False
             portal_requested = False
@@ -1356,9 +1411,75 @@ def handle_button(cfg):
     button_state = st
 
 
+def trigger_sw_short(cfg, source="GPIO"):
+    """SW（IO9）短按：循环切换下一路继电器状态（CH1→CH2→CH3→CH4→全关→循环）
+
+    触发后立即 publish 当前继电器状态（通过 sw_short_requested flag，主循环消费）
+    GPIO 和 HTTP 两条路径都复用本函数。
+    """
+    global sw_cycle_idx, sw_short_requested
+    target = SW_CYCLE[sw_cycle_idx]
+    sw_cycle_idx = (sw_cycle_idx + 1) % len(SW_CYCLE)
+    if target == "all":
+        # 循环里的"全关"步骤
+        changed = set_all_relay(False)
+        print("[SW] short press via %s, all relays OFF (cycle %d/%d) changed=%s"
+              % (source, sw_cycle_idx, len(SW_CYCLE), changed))
+    else:
+        cur = relay_is_on(target)
+        set_relay(target, not cur)
+        print("[SW] short press via %s, CH%d -> %s (cycle %d/%d)"
+              % (source, target + 1, "ON" if not cur else "OFF", sw_cycle_idx, len(SW_CYCLE)))
+    sw_short_requested = True  # 主循环消费后立即 publish
+    return True, None
+
+
+def trigger_sw_long(cfg, source="GPIO"):
+    """SW（IO9）长按：所有继电器强制关闭（应急复位）"""
+    changed = set_all_relay(False)
+    print("[SW] long press via %s, all relays OFF (emergency reset) changed=%s"
+          % (source, changed))
+    # 同时把 cycle 回到 0，让下次短按从 CH1 开始
+    global sw_cycle_idx
+    sw_cycle_idx = 0
+    # 长按也 publish 一次当前状态
+    global sw_short_requested
+    sw_short_requested = True
+    return True, None
+
+
+def handle_sw_button(cfg):
+    """SW（IO9，按下时机不同）GPIO 路径：
+    - 短按（< SW_LONG_PRESS_MS 释放） → trigger_sw_short()
+    - 长按（>= SW_LONG_PRESS_MS） → trigger_sw_long()
+    当 sw_button 引脚未配置时退化为 no-op；HTTP 路径不受影响。
+    """
+    global sw_button_state, sw_press_start, sw_long_triggered, sw_short_triggered
+    if sw_button is None:
+        return
+    st = sw_button.value()
+    now = now_ms()
+    if st == 0 and sw_button_state == 1:
+        # 刚按下
+        sw_press_start = now
+        sw_long_triggered = False
+        sw_short_triggered = False
+    if st == 0 and not sw_long_triggered:
+        if time.ticks_diff(now, sw_press_start) >= SW_LONG_PRESS_MS:
+            sw_long_triggered = True
+            trigger_sw_long(cfg, source="GPIO")
+    if st == 1 and sw_button_state == 0:
+        # 刚释放
+        dur = time.ticks_diff(now, sw_press_start)
+        if not sw_long_triggered and not sw_short_triggered and 0 < dur < SW_LONG_PRESS_MS:
+            sw_short_triggered = True
+            trigger_sw_short(cfg, source="GPIO")
+    sw_button_state = st
+
+
 # -------------------- 主入口 --------------------
 def main():
-    global wlan_sta, wlan_ap, button, led
+    global wlan_sta, wlan_ap, button, sw_button, led
     cfg = load_config()
     wlan_sta = network.WLAN(network.STA_IF)
     wlan_ap = network.WLAN(network.AP_IF)
@@ -1370,9 +1491,19 @@ def main():
     global button
     if sw1 is None:
         button = None
-        print("[MAIN] SW1_PIN disabled, GPIO button inactive (HTTP only)")
+        print("[MAIN] SW1_PIN disabled, GPIO SW1 inactive (HTTP only)")
     else:
         button = Pin(int(sw1), Pin.IN, Pin.PULL_UP)
+        print("[MAIN] SW1_PIN = GPIO%d" % int(sw1))
+    # SW (IO9) 按钮：板上 BOOT 按钮同脚；运行时为普通 GPIO
+    sw = cfg.get("sw_pin", SW_PIN)
+    global sw_button
+    if sw is None:
+        sw_button = None
+        print("[MAIN] SW_PIN disabled, GPIO SW inactive (HTTP only)")
+    else:
+        sw_button = Pin(int(sw), Pin.IN, Pin.PULL_UP)
+        print("[MAIN] SW_PIN = GPIO%d (short=cycle, long=all-off)" % int(sw))
     if LED_PIN is not None:
         led = Pin(LED_PIN, Pin.OUT, value=1)  # 熄灭（假设低电平亮）
 
