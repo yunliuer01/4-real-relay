@@ -1,0 +1,172 @@
+# 虚拟设备映射桥接器配置
+# 作用：把 4 路继电器网关上报的一包属性，拆成多个独立虚拟设备属性上报；
+#       并把对各虚拟设备的下行命令聚合回网关控制帧。
+
+mqtt:
+  broker: "172.16.4.211"
+  port: 9783
+  username: "test"
+  password: "123456"
+  # 桥接器自身 client_id（建议唯一，避免多个实例互顶）
+  client_id: "virtual-bridge-01"
+  # QoS，保持 1 可防止网络抖动时丢命令
+  qos: 1
+
+# 父网关设备（真实继电器/Modbus 网关）
+gateway:
+  product_id: "relay4-modbus-gateway"
+  device_id: "7ce8b1c1a7fc"
+
+# 子设备 topic 模式：与 JetLinks 物模型对齐
+# "direct"  -> /{product_id}/{device_id}/property/post
+# "sys"     -> /{product_id}/{device_id}/thing/event/property/post
+child_topic_mode: "direct"
+
+# ---------------- 继电器通道 → 虚拟设备 ----------------
+# 规则：
+#   property_map : 父设备 properties 里的 key -> 子设备属性 key
+#   event_map    : 父设备事件 -> 子设备事件
+#   command_map  : 子设备 functionId/method -> 网关命令
+relays:
+  - channel: 1
+    product_id: "virtual-lock"
+    device_id: "lock-001"
+    name: "门锁"
+    property_map:
+      ch1_state: lockState
+    event_map:
+      switch_change:
+        event_id: "unlockRecord"
+        data_map:
+          channel: sourceChannel
+          state: lockState
+    command_map:
+      # JetLinks 功能调用 / 属性写
+      setLock:
+        function_id: "set_channel"
+        inputs:
+          channel: 1
+          state: "{value}"
+      lockState:
+        function_id: "set_channel"
+        inputs:
+          channel: 1
+          state: "{value}"
+
+  - channel: 2
+    product_id: "virtual-light"
+    device_id: "light-001"
+    name: "灯1"
+    property_map:
+      ch2_state: switch
+      ch2_voltage: voltage
+      ch2_current: current
+      ch2_power: power
+    command_map:
+      switch:
+        function_id: "set_channel"
+        inputs:
+          channel: 2
+          state: "{value}"
+      turnOn:
+        function_id: "set_channel"
+        inputs:
+          channel: 2
+          state: true
+      turnOff:
+        function_id: "set_channel"
+        inputs:
+          channel: 2
+          state: false
+
+  - channel: 3
+    product_id: "virtual-light"
+    device_id: "light-002"
+    name: "灯2"
+    property_map:
+      ch3_state: switch
+      ch3_voltage: voltage
+      ch3_current: current
+      ch3_power: power
+    command_map:
+      switch:
+        function_id: "set_channel"
+        inputs:
+          channel: 3
+          state: "{value}"
+      turnOn:
+        function_id: "set_channel"
+        inputs:
+          channel: 3
+          state: true
+      turnOff:
+        function_id: "set_channel"
+        inputs:
+          channel: 3
+          state: false
+
+  - channel: 4
+    product_id: "virtual-ac"
+    device_id: "ac-001"
+    name: "空调开关"
+    property_map:
+      ch4_state: powerState
+    command_map:
+      powerState:
+        function_id: "set_channel"
+        inputs:
+          channel: 4
+          state: "{value}"
+      setPower:
+        function_id: "set_channel"
+        inputs:
+          channel: 4
+          state: "{value}"
+
+# ---------------- Modbus 采集值 → 虚拟传感器 ----------------
+# source_key 支持两种形式：
+#   1) 精确匹配父设备 properties 里的 key，如 s1_temperature
+#   2) 通配前缀：s1_* 表示把从站 1 所有 key 映射到同一子设备
+sensors:
+  # 真实 Modbus 从站 1（温湿度）
+  - product_id: "virtual-th"
+    device_id: "th-001"
+    name: "温湿度传感器"
+    # 把父设备里的 s1_temperature / s1_humidity 等转发到本设备
+    source_pattern: "s1_*"
+    property_map:
+      s1_temperature: temperature
+      s1_humidity: humidity
+
+# ---------------- 模拟传感器（不依赖真实硬件） ----------------
+# 由桥接器内部定时生成属性并上报，用于演示多设备场景
+simulated:
+  - product_id: "virtual-pir"
+    device_id: "pir-001"
+    name: "人体感应器"
+    interval_seconds: 5
+    properties:
+      - key: occupancy
+        type: random_choice
+        choices: [0, 1]
+        weights: [0.75, 0.25]
+
+  - product_id: "virtual-smoke"
+    device_id: "smoke-001"
+    name: "烟雾感应器"
+    interval_seconds: 10
+    properties:
+      - key: smoke
+        type: random_int
+        min: 0
+        max: 80
+      - key: alarm
+        type: random_choice
+        choices: [false, true]
+        weights: [0.97, 0.03]
+
+# 可选：REST API 暴露运行状态
+http_api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 18080

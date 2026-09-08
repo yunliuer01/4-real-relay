@@ -33,3 +33,9 @@ data/device_backup.json
 /update_cfg.py
 /_press1.lognecho
 firmware-simtest/flash_modbus/_*.py
+
+# 桥接器临时/测试产物
+/virtual-device-bridge/_*.py
+/virtual-device-bridge/_*.log
+/virtual-device-bridge/_*.pid
+/virtual-device-bridge/__pycache__/
