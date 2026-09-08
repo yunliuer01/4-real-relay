@@ -30,6 +30,12 @@ except Exception as _e:
     ModbusMaster = None
     HAS_MODBUS = False
 
+# MicroPython 的 _thread 模块（HTTP 控制 API 用；缺时自动跳过）
+try:
+    import _thread
+except ImportError:
+    _thread = None
+
 # -------------------- 硬件配置（按实际板子修改） --------------------
 RELAY_PINS = [3, 4, 5, 7]                   # 4 路继电器 GPIO（低电平吸合）
 SW1_PIN = 10                                 # 配网按键 SW1 = IO10（上拉，按下低电平）
@@ -690,6 +696,174 @@ def render_page(cfg):
     return PAGE.format(**d)
 
 
+def _parse_query(path):
+    """解析 query string 到 dict（仅供 HTTP API 用，不处理 urlencoding 全套）"""
+    q = {}
+    if "?" not in path:
+        return q
+    qs = path.split("?", 1)[1]
+    for pair in qs.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            q[k] = v
+    return q
+
+
+def _http_json(conn, code, obj):
+    """200 OK + JSON body"""
+    body = json.dumps(obj)
+    http_send(conn, code, body, "application/json")
+
+
+def http_api_handler(cfg, conn):
+    """HTTP 控制 API 路由（STA 模式下独立线程跑）
+
+    路由：
+    - GET /api/relay?ch=N&state=0/1  → 控制单路
+    - GET /api/relay/all?state=0/1   → 全部控制
+    - GET /api/status                → 当前 4 路状态
+    - GET /api/info                  → IP/MAC/firmware/网络信息
+    - GET /api/sw1?short=1|long=1    → SW1 动作（仿真测试用）
+    """
+    try:
+        head, _, rest = _read_request(conn)
+    except Exception as e:
+        http_send(conn, "400 Bad Request", "read err: %s" % e)
+        return
+    try:
+        first = head.split(b"\r\n", 1)[0].decode("utf-8", "replace").split()
+        method = first[0]
+        path = first[1]
+    except Exception as e:
+        http_send(conn, "400 Bad Request", "bad req: %s" % e)
+        return
+
+    if method != "GET":
+        http_send(conn, "405 Method Not Allowed", "GET only")
+        return
+
+    if path == "/api/status":
+        snap = {}
+        for i in range(1, CHANNEL_COUNT + 1):
+            snap["ch%d" % i] = bool(relay_is_on(i - 1))
+        _http_json(conn, "200 OK", {"ok": True, "channels": snap})
+        return
+
+    if path == "/api/info":
+        info = {
+            "ok": True,
+            "device_id": cfg.get("device_id", ""),
+            "mac": mac_str(),
+            "wifi_connected": False,
+            "ip": "",
+        }
+        try:
+            if wlan_sta and wlan_sta.isconnected():
+                info["wifi_connected"] = True
+                info["ip"] = wlan_sta.ifconfig()[0]
+        except Exception:
+            pass
+        _http_json(conn, "200 OK", info)
+        return
+
+    if path.startswith("/api/relay"):
+        q = _parse_query(path)
+        try:
+            if path.startswith("/api/relay/all"):
+                state = int(q.get("state", 1))
+                changed = set_all_relay(bool(state))
+                _http_json(conn, "200 OK",
+                           {"ok": True, "all": bool(state),
+                            "changed": [i + 1 for i in changed]})
+                # 触发一次主动上报（即使 broker 下行不通也能把状态同步上去）
+                try:
+                    publish_property(cfg)
+                except Exception:
+                    pass
+                return
+            ch = int(q.get("ch", 0))
+            state = q.get("state", None)
+            if state is None or not (1 <= ch <= CHANNEL_COUNT):
+                _http_json(conn, "400 Bad Request",
+                           {"ok": False, "err": "need ch(1..4) and state(0/1)"})
+                return
+            ok = set_relay(ch - 1, int(state))
+            _http_json(conn, "200 OK",
+                       {"ok": True, "ch": ch, "state": int(state), "changed": ok})
+            try:
+                publish_property(cfg)
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            _http_json(conn, "500 Internal Server Error",
+                       {"ok": False, "err": str(e)})
+            return
+
+    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1)")
+
+
+def _read_request(conn):
+    """读 HTTP request head + body；返回 (head_bytes, sep, body_bytes)"""
+    conn.settimeout(3)
+    req = conn.recv(2048)
+    head, _, rest = req.partition(b"\r\n\r\n")
+    clen = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            try:
+                clen = int(line.split(b":")[1].strip())
+            except Exception:
+                pass
+    while len(rest) < clen:
+        rest += conn.recv(1024)
+    return head, b"\r\n\r\n", rest
+
+
+def start_control_http(cfg):
+    """在 STA 模式下启独立 HTTP 控制 API（端口 80），用于局域网直连控制继电器
+
+    用于 MQTT broker 下行不通时绕过 broker。线程驱动，不阻塞主循环。
+    """
+    if _thread is None:
+        print("[HTTP API] _thread not available, skip")
+        return
+
+    def _serve():
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0", 80))
+            srv.listen(3)
+            print("[HTTP API] listening on port 80")
+        except Exception as e:
+            print("[HTTP API] bind error:", e)
+            return
+        while True:
+            try:
+                conn, addr = srv.accept()
+            except Exception:
+                continue
+            try:
+                http_api_handler(cfg, conn)
+            except Exception as e:
+                try:
+                    http_send(conn, "500 Internal Server Error", "err: %s" % e)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    try:
+        _thread.start_new_thread(_serve, ())
+        print("[HTTP API] thread started")
+    except Exception as e:
+        print("[HTTP API] thread fail:", e)
+
+
 def portal(cfg):
     """进入 AP 配网模式"""
     global client
@@ -848,6 +1022,8 @@ def run_normal(cfg):
 
     # 连上 WiFi 后立即启动 Modbus 采集线程，避免阻塞继电器主循环
     start_modbus(cfg)
+    # 同时启 HTTP 控制 API（端口 80），用于 broker 下行不通时的局域网直连
+    start_control_http(cfg)
 
     interval_ms = max(1, int(cfg.get("report_interval", REPORT_INTERVAL_S))) * 1000
     last_report = 0
