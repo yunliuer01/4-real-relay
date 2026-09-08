@@ -72,10 +72,10 @@ DEFAULT_MODBUS_CONFIG = {
 DEFAULT_CONFIG = {
     "wifi_ssid": "",
     "wifi_password": "",
-    "mqtt_host": "",
-    "mqtt_port": 1883,
-    "mqtt_user": "",
-    "mqtt_password": "",
+    "mqtt_host": "172.16.4.211",
+    "mqtt_port": 9783,
+    "mqtt_user": "test",
+    "mqtt_password": "123456",
     "product_id": "relay4_lfx",
     "device_id": "",
     "report_interval": REPORT_INTERVAL_S,
@@ -670,19 +670,20 @@ def http_send(conn, status, body, ctype="text/html"):
 
 
 def render_page(cfg):
+    # 只填充 PAGE 模板需要的字段，避免 relay_pins/sw1_pin 这些硬件常量
+    # 触发 str.format "extra keyword arguments given" 让 portal 循环崩
+    keys = ("wifi_ssid", "wifi_password",
+            "mqtt_host", "mqtt_port", "mqtt_user", "mqtt_password",
+            "product_id", "device_id", "report_interval")
     d = {}
-    for k in DEFAULT_CONFIG:
+    for k in keys:
         v = cfg.get(k, DEFAULT_CONFIG[k])
-        if k == "modbus":
-            # modbus 是嵌套 dict，直接序列化为 JSON 文本
-            try:
-                d["modbus_json"] = json.dumps(v, ensure_ascii=False)
-            except Exception:
-                d["modbus_json"] = json.dumps(DEFAULT_MODBUS_CONFIG, ensure_ascii=False)
-            continue
-        if isinstance(v, list):
-            v = ",".join(str(x) for x in v)
         d[k] = str(v).replace('"', "&quot;")
+    # MicroPython json.dumps 不支持 ensure_ascii 参数（CPython 有）
+    try:
+        d["modbus_json"] = json.dumps(cfg.get("modbus", DEFAULT_MODBUS_CONFIG))
+    except Exception:
+        d["modbus_json"] = json.dumps(DEFAULT_MODBUS_CONFIG)
     d["mac"] = mac_str()
     d["sel_direct"] = 'selected' if cfg.get("topic_mode", "direct") == "direct" else ""
     d["sel_sys"] = 'selected' if cfg.get("topic_mode", "direct") == "sys" else ""
@@ -736,7 +737,18 @@ def portal(cfg):
                 pass
             continue
         if method == "GET" and path == "/":
-            http_send(conn, "200 OK", render_page(cfg))
+            try:
+                body = render_page(cfg)
+                http_send(conn, "200 OK", body)
+            except Exception as e:
+                print("render_page err:", e)
+                try:
+                    http_send(conn, "500 Internal Server Error", "render error: %s" % e)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         elif method == "POST" and path == "/save":
             form = parse_form(rest.decode("utf-8", "replace"))
             for k in ("wifi_ssid", "wifi_password", "mqtt_host", "mqtt_user", "mqtt_password", "product_id", "device_id"):
