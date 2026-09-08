@@ -7,10 +7,12 @@
 - Modbus RTU 主站：独立线程轮询多从站、多寄存器，不阻塞继电器控制
 - 持久化：配置写入 flash /config.json，掉电不丢失
 - 断线重连：WiFi/MQTT 均支持自动重连
+- HTTP 控制 API：STA 模式下端口 80，可直连控制继电器 / 模拟 SW1 动作（无杜邦线时也能裸测按钮）
 
 硬件接线（CORE-ESP32-C3 四路继电器板）：
 - 继电器低电平吸合：RELAY1=IO3, RELAY2=IO4, RELAY3=IO5, RELAY4=IO7
-- SW1 按键：IO10，上拉输入，按下为低电平（长按 5 秒进配网）
+- SW1 按键：默认 GPIO3（MISO），上拉输入，按下为低电平（长按 5 秒进配网）
+  - 板上 BOOT 按钮在 GPIO9（strapping pin），按下复位芯片，不能当 SW1
 - LED 指示灯：IO2
 - Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8
 """
@@ -38,7 +40,7 @@ except ImportError:
 
 # -------------------- 硬件配置（按实际板子修改） --------------------
 RELAY_PINS = [3, 4, 5, 7]                   # 4 路继电器 GPIO（低电平吸合）
-SW1_PIN = 10                                 # 配网按键 SW1 = IO10（上拉，按下低电平）
+SW1_PIN = 3                                  # LOLIN C3 MINI 上 GPIO9 是板载 BOOT 按钮（按下会触发 ESP32-C3 复位，不能当 SW1）；改用 MISO=GPIO3 外接按键到 GND
 LED_PIN = 2                                  # 状态指示灯 GPIO（IO2）
 AP_SSID = "Relay4-Setuplfx"                # 配网热点名称（加了 lfx 后缀避免和别人板子冲突）
 AP_IP = "192.168.4.1"
@@ -107,6 +109,8 @@ wifi_retry = 0
 button_state = 1
 press_start = 0
 long_triggered = False
+short_triggered = False
+portal_requested = False  # HTTP / GPIO 共用的"请求进入 AP 配网"标志
 
 # -------------------- 工具函数 --------------------
 def load_config():
@@ -723,7 +727,9 @@ def http_api_handler(cfg, conn):
     - GET /api/relay/all?state=0/1   → 全部控制
     - GET /api/status                → 当前 4 路状态
     - GET /api/info                  → IP/MAC/firmware/网络信息
-    - GET /api/sw1?short=1|long=1    → SW1 动作（仿真测试用）
+    - GET /api/sw1?action=short     → 触发短按（立即 publish）
+    - GET /api/sw1?action=long       → 模拟长按（不真进 portal，安全）
+    - GET /api/sw1?action=long&real=1→ 真长按（踢 STA 进 AP 配网，自负风险）
     """
     try:
         head, _, rest = _read_request(conn)
@@ -766,6 +772,34 @@ def http_api_handler(cfg, conn):
         _http_json(conn, "200 OK", info)
         return
 
+    if path == "/api/sw1" or path.startswith("/api/sw1?"):
+        # 无杜邦线时用裸 HTTP 触发 SW1 的业务逻辑（短按/长按）
+        q = _parse_query(path)
+        action = (q.get("action", "") or "").lower()
+        if action == "short":
+            ok, err = trigger_short_press(cfg, source="HTTP")
+            payload = {"ok": ok, "action": "short", "source": "HTTP"}
+            if err:
+                payload["err"] = err
+            _http_json(conn, "200 OK", payload)
+            return
+        if action == "long":
+            real = (q.get("real", "0") in ("1", "true", "yes"))
+            enter_portal = bool(real)
+            trigger_long_press(cfg, source="HTTP", enter_portal=enter_portal)
+            payload = {
+                "ok": True,
+                "action": "long",
+                "source": "HTTP",
+                "simulated": not enter_portal,
+                "portal_requested": bool(enter_portal),
+            }
+            _http_json(conn, "200 OK", payload)
+            return
+        _http_json(conn, "400 Bad Request",
+                   {"ok": False, "err": "need ?action=short|long[&real=1]"})
+        return
+
     if path.startswith("/api/relay"):
         q = _parse_query(path)
         try:
@@ -800,7 +834,7 @@ def http_api_handler(cfg, conn):
                        {"ok": False, "err": str(e)})
             return
 
-    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1)")
+    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short)")
 
 
 def _read_request(conn):
@@ -1016,7 +1050,7 @@ def stop_modbus():
 
 
 def run_normal(cfg):
-    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, mb_master
+    global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, mb_master
     if not connect_wifi(cfg):
         return False
 
@@ -1039,8 +1073,9 @@ def run_normal(cfg):
 
         # 检查 SW1 长按进配网
         handle_button(cfg)
-        if long_triggered:
+        if long_triggered or portal_requested:
             long_triggered = False
+            portal_requested = False
             print("SW1 long press -> portal")
             mqtt_disconnect()
             stop_modbus()
@@ -1090,18 +1125,62 @@ def run_normal(cfg):
 
 
 # -------------------- 按键处理 --------------------
+def trigger_short_press(cfg, source="GPIO"):
+    """短按触发：立即 publish 一次 property（不论来自 GPIO 还是 HTTP 都走这里）
+
+    返回 (ok:bool, err:str|None)
+    """
+    print("[BUTTON] short press via %s, trigger immediate publish" % source)
+    try:
+        publish_property(cfg)
+        print("[BUTTON] immediate publish OK")
+        return True, None
+    except Exception as e:
+        print("[BUTTON] immediate publish err:", e)
+        return False, str(e)
+
+
+def trigger_long_press(cfg, source="GPIO", enter_portal=False):
+    """长按触发：默认仅模拟（不真正进 AP），加 enter_portal=True 才会踢出 STA 模式
+
+    HTTP 默认 enter_portal=False 避免裸测时被一脚踢出 broker 会话；
+    真要测 portal 转换，传 enter_portal=True 或 HTTP query 里加 real=1。
+    """
+    global portal_requested
+    if enter_portal:
+        portal_requested = True
+        print("[BUTTON] long press via %s, portal transition armed" % source)
+    else:
+        print("[BUTTON] long press via %s, simulated (no portal transition)" % source)
+    return True
+
+
 def handle_button(cfg):
-    global button_state, press_start, long_triggered
+    """SW1 按键：
+    - 短按（按下后 < LONG_PRESS_MS 释放） → trigger_short_press()
+    - 长按（持续 >= LONG_PRESS_MS） → 设 long_triggered=True，run_normal 进入 portal
+    按键的"业务动作"在 trigger_xxx 里，HTTP handler 也复用。
+    """
+    global button_state, press_start, long_triggered, short_triggered
     st = button.value()
     now = now_ms()
     if st == 0 and button_state == 1:
+        # 刚按下
         press_start = now
         long_triggered = False
+        short_triggered = False
     if st == 0 and not long_triggered:
         if time.ticks_diff(now, press_start) >= LONG_PRESS_MS:
             long_triggered = True
+            # 用 trigger_long_press 让 GPIO 和 HTTP 走同一路径；enter_portal=True 走真的
+            trigger_long_press(cfg, source="GPIO", enter_portal=True)
+            print("[BUTTON] GPIO long press armed, run_normal will enter portal")
     if st == 1 and button_state == 0:
-        pass  # 松开，不足 5 秒无动作
+        # 刚释放
+        dur = time.ticks_diff(now, press_start)
+        if not long_triggered and not short_triggered and 0 < dur < LONG_PRESS_MS:
+            short_triggered = True
+            trigger_short_press(cfg, source="GPIO")
     button_state = st
 
 
