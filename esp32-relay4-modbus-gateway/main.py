@@ -106,6 +106,7 @@ wlan_ap = None
 client = None
 topics = None
 mb_master = None
+_http_srv = None             # HTTP API 监听 socket 全局引用
 last_ping = 0
 last_report = 0
 mqtt_retry = 0
@@ -1059,12 +1060,24 @@ def start_control_http(cfg):
         print("[HTTP API] _thread not available, skip")
         return
 
+    # 增大线程栈，避免复杂 handler 在 _thread 里爆栈导致 socket 被默默回收
+    try:
+        _thread.stack_size(8 * 1024)
+    except Exception:
+        pass
+
+    # 全局引用监听 socket，防止 GC 在线程异常退出时回收它
+    global _http_srv
+    _http_srv = None
+
     def _serve():
+        global _http_srv
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind(("0.0.0.0", 80))
             srv.listen(3)
+            _http_srv = srv
             print("[HTTP API] listening on port 80")
         except Exception as e:
             print("[HTTP API] bind error:", e)
@@ -1077,6 +1090,7 @@ def start_control_http(cfg):
             try:
                 http_api_handler(cfg, conn)
             except Exception as e:
+                print("[HTTP API] handler error:", e)
                 try:
                     http_send(conn, "500 Internal Server Error", "err: %s" % e)
                 except Exception:
