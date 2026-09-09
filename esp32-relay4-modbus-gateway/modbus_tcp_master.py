@@ -26,6 +26,10 @@ class ModbusTCPMaster:
         self.timeout_ms = int(config.get("timeout_ms", 500))
         self.retries = int(config.get("retries", 2))
         self.retry_interval_ms = int(config.get("retry_interval_ms", 500))
+        # 连接失败退避：从站离线时避免 1s 一次风暴重连。实测每轮失败泄漏的
+        # lwIP pcb/buffer 会把设备资源耗尽（ENOBUFS/ENOMEM），拖垮 MQTT 与
+        # HTTP 线程（thread fail: can't create thread）。退避期间只查表不建连。
+        self.backoff_ms = int(config.get("backoff_ms", 5000))
         # slaves 列表：每个元素包含 host, port, unit_id, enabled, registers
         self.slaves = config.get("slaves", [])
 
@@ -37,6 +41,8 @@ class ModbusTCPMaster:
         self._cycle_counts = {}
         self._last_poll = {}
         self._conns = {}   # slave_idx -> socket（复用连接）
+        self._backoff_until = {}   # slave_idx -> ticks_ms 下次允许建连的时刻
+        self._last_err_log = {}    # slave_idx -> ticks_ms 上次打 ERROR 日志的时刻（节流）
         self._trans_id = 0
 
     def _log(self, level, msg):
@@ -64,7 +70,11 @@ class ModbusTCPMaster:
         port = int(slave_cfg.get("port", 502))
         if self._conns.get(slave_idx) is not None:
             return self._conns[slave_idx]
-
+        # 退避期未到：直接返回 None（不创建 socket），由 _poll_slave 的
+        # 周期节拍自然降频，避免失败风暴耗尽 lwIP 资源
+        _bu = self._backoff_until.get(slave_idx, 0)
+        if _bu and time.ticks_diff(_bu, time.ticks_ms()) > 0:
+            return None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout_ms / 1000.0)
@@ -74,6 +84,14 @@ class ModbusTCPMaster:
             return sock
         except Exception as e:
             self._log("WARN", "slave[%d] connect %s:%d failed: %s" % (slave_idx, host, port, e))
+            # 关键：失败后必须 close，否则半开 socket 在 lwIP 里滞留，
+            # 几十秒风暴后 ENOBUFS/ENOMEM 拖垮 MQTT/HTTP
+            try:
+                sock.close()
+            except Exception:
+                pass
+            # 进入退避：backoff_ms 内不再尝试建连
+            self._backoff_until[slave_idx] = time.ticks_ms() + self.backoff_ms
             return None
 
     def _send_recv(self, slave_idx, slave_cfg, pdu):
@@ -128,6 +146,8 @@ class ModbusTCPMaster:
                 except Exception:
                     pass
                 self._conns[slave_idx] = None
+                # 通信异常同样进退避：防止"握手成功但服务异常"的半开风暴
+                self._backoff_until[slave_idx] = time.ticks_ms() + self.backoff_ms
                 if attempt + 1 < self.retries:
                     time.sleep_ms(self.retry_interval_ms)
                     sock = self._connect(slave_idx, slave_cfg)
@@ -220,8 +240,12 @@ class ModbusTCPMaster:
             raw, err = self.read_register(slave_idx, slave_cfg, addr, func)
             if err is not None:
                 self._error_counts[sid] += 1
-                self._log("ERROR", "slave[%d] addr=0x%04x key=%s err=%s" %
-                          (slave_idx, addr, key, err))
+                # 日志节流：同一从站最多 5s 打一条 ERROR，避免离线时刷屏
+                _nowl = time.ticks_ms()
+                if time.ticks_diff(_nowl, self._last_err_log.get(sid, 0)) > 5000:
+                    self._last_err_log[sid] = _nowl
+                    self._log("ERROR", "slave[%d] addr=0x%04x key=%s err=%s" %
+                              (slave_idx, addr, key, err))
                 continue
 
             if signed and raw > 32767:
@@ -236,7 +260,12 @@ class ModbusTCPMaster:
 
     def _worker(self):
         """独立线程入口"""
+        import gc
         self._log("INFO", "worker thread started")
+        # 启动先歇 2s：主线程此刻正初始化 HTTP/MQTT（建 socket/分配线程栈），
+        # 若 worker 立即对离线从站发起重试会抢占堆与 lwIP buffer，实测可致
+        # "can't create thread" / MQTT ECONNABORTED。错峰后再轮询。
+        time.sleep_ms(2000)
         while self._running:
             try:
                 for si, slave in enumerate(self.slaves):
@@ -270,6 +299,8 @@ class ModbusTCPMaster:
             return False
         if self._running:
             return True
+        import gc
+        gc.collect()  # 创建线程前回收碎片，避免线程栈分配失败
         self._running = True
         self._thread_id = _thread.start_new_thread(self._worker, ())
         self._log("INFO", "started, thread_id=%s" % str(self._thread_id))

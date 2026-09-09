@@ -34,6 +34,11 @@ data/device_backup.json
 /_press1.lognecho
 firmware-simtest/flash_modbus/_*.py
 
+# 板级备份（含 config.json 连接信息，勿入库）
+/_board_backup*/
+# 调试期下载的备用固件（非当前出厂镜像）
+esp32-relay4-modbus-gateway/ESP32_GENERIC_C3*.bin
+
 # 桥接器临时/测试产物
 /virtual-device-bridge/_*.py
 /virtual-device-bridge/_*.log

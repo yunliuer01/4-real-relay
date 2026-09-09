@@ -25,22 +25,13 @@ import time
 import machine
 from machine import Pin, reset
 
-# 如果 modbus 模块已经上传到板子，则导入；否则给出占位对象，避免 main.py 直接崩溃
-try:
-    from modbus_tcp_master import ModbusTCPMaster
-    HAS_MODBUS_TCP = True
-except Exception as _e:
-    print("[MAIN] modbus_tcp_master import failed:", _e)
-    ModbusTCPMaster = None
-    HAS_MODBUS_TCP = False
-
-try:
-    from modbus_master import ModbusMaster
-    HAS_MODBUS = True
-except Exception as _e:
-    print("[MAIN] modbus_master import failed:", _e)
-    ModbusMaster = None
-    HAS_MODBUS = False
+# modbus 模块改为 start_modbus() 内按需 import：C3 堆紧张，两个模块同时
+# import（源码合计 24KB，字节码常驻堆）会挤占线程栈分配，实测导致
+# "HTTP API thread fail: can't create thread"。延迟 import 后只加载需要的那个。
+HAS_MODBUS_TCP = False
+HAS_MODBUS = False
+ModbusTCPMaster = None
+ModbusMaster = None
 
 # MicroPython 的 _thread 模块（HTTP 控制 API 用；缺时自动跳过）
 try:
@@ -57,7 +48,8 @@ AP_SSID = "Relay4-Setuplfx"                # 配网热点名称（加了 lfx 后
 AP_IP = "192.168.4.1"
 
 # -------------------- 运行参数 --------------------
-WIFI_TIMEOUT_S = 30          # 上电连 WiFi 超时时间
+WIFI_TIMEOUT_S = 45          # 上电连 WiFi 超时时间（单次 1001 connecting 等待预算；
+                             # REPL 实证 esp-sha 瞬时内存压力下驱动自愈最长 ~40s）
 LONG_PRESS_MS = 5000         # 长按 SW1 进入配网模式时间
 SW_LONG_PRESS_MS = 3000      # 长按 SW 时间（全关所有继电器）
 RETRY_S = 5                  # WiFi/MQTT 断线重连周期
@@ -118,6 +110,9 @@ led = None
 wlan_sta = None
 wlan_ap = None
 _sta_was_active = False  # 本进程是否曾对 STA 调过 active(True)；portal 收尾只碰启动过的接口
+_sta_connected_once = False  # 本进程 STA 是否曾连上 WiFi（区分"运行中主动进 portal"与"失败兜底进 portal"）
+_wifi_fail_streak = 0        # 本进程 WiFi 失败累计（超时/give up 时+1）；仅供日志参考
+_wifi_failed_this_boot = False  # 本进程 WiFi 是否失败过（守卫据此决定不进 AP 而复位重试）
 client = None
 topics = None
 mb_master = None
@@ -389,6 +384,10 @@ def mqtt_connect(cfg):
     topics = TopicManager(cfg["product_id"], cfg["device_id"], cfg.get("topic_mode", "direct"))
     print("MQTT topics base:", topics.base)
     try:
+        import gc
+        # umqtt.simple import + socket 建立前回收碎片（C3 堆紧张，实测
+        # 不 collect 时偶发 ECONNABORTED/ENOMEM 建连失败）
+        gc.collect()
         # umqtt.simple 要求 bytes：topic/payload/client_id 均显式编码
         c = MQTTClient(
             cfg["device_id"].encode("utf-8"),
@@ -976,9 +975,13 @@ def start_control_http(cfg):
         print("[HTTP API] _thread not available, skip")
         return
 
-    # 增大线程栈，避免复杂 handler 在 _thread 里爆栈导致 socket 被默默回收
+    # 线程栈大小：MicroPython 里 stack_size 是"全局"设置，会传染给之后创建的
+    # 所有线程（含 Modbus worker）。且线程栈从 ESP-IDF 内部 RAM 分配（不是
+    # MicroPython GC heap！），C3 内部 RAM 大部分被 GC heap + WiFi/lwIP 划走，
+    # 实测 8KB/6KB 均分配失败（can't create thread），4KB 是上限（2026-09 REPL
+    # 逐档实测：8192 FAIL / 6144 FAIL / 4096 OK，mem_free 147KB 空闲也无效）。
     try:
-        _thread.stack_size(8 * 1024)
+        _thread.stack_size(4 * 1024)
     except Exception:
         pass
 
@@ -1030,6 +1033,8 @@ def start_control_http(cfg):
         print("[HTTP API] server stopped")
 
     try:
+        import gc
+        gc.collect()  # 回收碎片再分配线程栈，降低 can't create thread 概率
         _thread.start_new_thread(_serve, ())
         print("[HTTP API] thread started")
     except Exception as e:
@@ -1045,6 +1050,23 @@ def portal(cfg):
     -> 关 STA -> 开 AP。
     """
     global client, _http_stop
+    # 0) WiFi 失败风暴守卫（必须在一切 esp_wifi / lwIP 操作之前，且只用纯 Python
+    #    标志判断，不再调用 status()/isconnected()）：
+    #    esp-sha 分配失败风暴(202/203/超时)后驱动进入坏状态，任何 esp_wifi
+    #    模式切换都会触发同址 Load access fault @0x420f8b0e Guru Meditation
+    #    （2026-09 实机：teardown 全跳过、纯等 8s 后仍崩在 AP active/deepsleep
+    #    —— 该址即 esp_wifi stop 路径）。带病开 AP 必崩，deepleep 调 esp_wifi_stop
+    #    同样可能崩。唯一不碰驱动的重启是 machine.reset()（直接 esp_restart，
+    #    不经 esp_wifi_stop）；MicroPython boot 会重新 esp_wifi_init，驱动全新。
+    #    实测 v5.4.1 A/B 软复位一次即连上 —— 软复位后驱动干净，连不上纯属
+    #    当时环境/射频干扰（esp-sha 分配失败）。故失败风暴 -> 复位重试循环，
+    #    直到环境恢复；复位周期约 20s，无崩溃刷屏。无 WiFi 配置(首配)时从未
+    #    真正发起连接，不视为失败，正常开 AP 供配网。
+    if cfg.get("wifi_ssid") and _wifi_failed_this_boot and not _sta_connected_once:
+        print("[portal] wifi fail storm this boot -> soft reset retry (streak=%d)" % _wifi_fail_streak)
+        time.sleep(1)
+        reset()
+        return
     # 1) 通知 HTTP 控制线程退出（accept 1s 超时轮询 _http_stop），释放端口 80。
     #    注意：经 flag 软复位的干净路径此时 _http_srv 必为 None，直接跳过等待。
     _http_stop = True
@@ -1066,15 +1088,29 @@ def portal(cfg):
     #    Load access fault (MEPC 0x420f8b0e) Guru Meditation 硬崩溃
     #    （try/except 拦不住硬件 fault，此前热点"一闪而逝"即因此）。
     if _sta_was_active:
+        # 只在 STA "当前已连接"时才做 teardown —— 这是运行中长按/HTTP 进入
+        # portal 的正常路径（v5.2 实机验证稳定）。WiFi 连接失败/超时兜底进来
+        # 的路径（connect_wifi 已返回 False）STA 从未连上，反复失败后驱动可能
+        # 滞留 1001(connecting)/39(怪异) 等状态，此时 disconnect()/active(False)
+        # 会触发 Load access fault @0x420f8b0e 硬崩溃（try/except 拦不住）。
+        # 失败/未知态一律跳过收尾：STA 已断开是惰性的，与 AP 并发无碍。
+        _teardown = False
         try:
-            wlan_sta.disconnect()
+            _teardown = bool(wlan_sta.isconnected())
         except Exception:
-            pass
-        time.sleep(0.3)
-        try:
-            wlan_sta.active(False)
-        except Exception:
-            pass
+            _teardown = False
+        if _teardown:
+            try:
+                wlan_sta.disconnect()
+            except Exception:
+                pass
+            time.sleep(0.3)
+            try:
+                wlan_sta.active(False)
+            except Exception:
+                pass
+        else:
+            print("[portal] STA not connected, skip STA teardown")
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
     ap.config(essid=AP_SSID, password="", authmode=network.AUTH_OPEN)
@@ -1173,16 +1209,19 @@ def portal(cfg):
 def connect_wifi(cfg):
     """连接 STA WiFi（状态机版）。
 
-    关键经验（v5.1 实机踩坑）：
+    关键经验（v5.1/v6.0.1 实机踩坑）：
     1. connect() 后驱动进入 connecting(1001)，此期间再调 connect() 会报
        "sta is connecting, return error / Wifi Internal Error" —— 这是正常
        拒绝，不是故障，绝不能因此触发 active(False) 重启接口（在连接中
        deinit WLAN 会 Guru Meditation 崩溃，热点/日志循环重启）。
-    2. 只在驱动空闲(IDLE=1000)时才发起 connect；connecting 时只等待。
-    3. 失败态(1002 密码错/1003 无AP/1004 连接失败)时 disconnect 重置再连。
+    2. 驱动空闲(IDLE=1000)或处于失败态时才发起 connect；connecting(1001)
+       时只等待。
+    3. 收到失败码(201 无AP/202 密码错/203 连接失败)时 disconnect 重置，
+       然后**不等驱动回 1000 直接重发**——实测 disconnect() 后 status 可能
+       长期停留在失败码不回 IDLE，若傻等会陷入 203 无限重试死循环。
     """
     import gc
-    global _sta_was_active
+    global _sta_was_active, _sta_connected_once, _wifi_fail_streak, _wifi_failed_this_boot
     wlan_sta.active(True)
     _sta_was_active = True  # 记录本进程已启动过 STA（portal 收尾据此决定是否 teardown）
     time.sleep(2)  # 等驱动就绪，避免 Internal Error
@@ -1190,10 +1229,33 @@ def connect_wifi(cfg):
     start = now_ms()
     issued = False  # 本次循环是否已发出 connect
     tries = 0
+    _fail_seen = None  # 失败码连续出现起点（esp-sha 自愈观察窗计时）
+    FAIL_SETTLE_MS = 12000  # 失败码静默观察窗：期间不断开，给驱动自愈留窗口
     while not wlan_sta.isconnected():
         _now2 = now_ms()
-        if tries >= 3:
-            print("[wifi] give up after 3 tries, enter portal")
+        # === 驱动自愈观察窗（esp-sha 瞬时内存压力）===
+        # 2026-09-09 REPL 实证：模拟 main.py 内存压力下单次 connect 后，驱动
+        # 内部会自行重试握手，esp-sha buffer 分配失败可刷屏数十秒后最终连上，
+        # 前提是不 disconnect 打断它。收到失败码后先静默观察 FAIL_SETTLE_MS，
+        # 期间只轮询 isconnected，不重发不断开；窗口耗尽仍未连上才允许重置。
+        if _fail_seen is not None and \
+                time.ticks_diff(_now2, _fail_seen) < FAIL_SETTLE_MS:
+            for _ in range(6):
+                if wlan_sta.isconnected():
+                    break
+                time.sleep(0.5)
+            continue
+        if tries >= 8:
+            print("[wifi] give up after 8 tries, enter portal")
+            _wifi_fail_streak += 1
+            _wifi_failed_this_boot = True
+            # 防御性收尾：确保驱动不在 connecting 就进 portal（避免 teardown 崩溃）
+            try:
+                if not wlan_sta.isconnected() and wlan_sta.status() != 1000:
+                    wlan_sta.disconnect()
+            except Exception:
+                pass
+            time.sleep(0.3)
             return False
         if time.ticks_diff(_now2, start) > WIFI_TIMEOUT_S * 1000:
             try:
@@ -1201,6 +1263,32 @@ def connect_wifi(cfg):
             except Exception as _e:
                 print("[wifi] TIMEOUT status print err:", _e)
             print("WiFi connect timeout")
+            _wifi_fail_streak += 1
+            _wifi_failed_this_boot = True
+            # 超时返回前把驱动收尾到空闲：若仍卡在 connecting(1001) 就直接进
+            # portal()，那里对"连接中"的 STA 做 disconnect/active(False) 会
+            # 触发 Load access fault (MEPC 0x420f8b0e) Guru Meditation 硬崩溃。
+            # 先等最多 8s 落定——若迟到连上则直接返回成功，否则 disconnect 中止。
+            _settle = now_ms()
+            while not wlan_sta.isconnected() and wlan_sta.status() == 1001 \
+                    and time.ticks_diff(now_ms(), _settle) < 8000:
+                time.sleep(0.5)
+            if wlan_sta.isconnected():
+                print("WiFi connected:", wlan_sta.ifconfig()[0])
+                _sta_connected_once = True
+                _wifi_fail_streak = 0
+                _wifi_failed_this_boot = False
+                return True
+            # 已离开 connecting（落定为失败码/空闲）才 disconnect 收尾；若 8s 后
+            # 仍死死卡在 connecting，则原样返回（portal 侧的守卫也会跳过 teardown，
+            # AP 与卡住的 STA 并发即可），绝不触碰连接中的驱动。
+            try:
+                if wlan_sta.status() != 1001:
+                    wlan_sta.disconnect()
+            except Exception:
+                pass
+            time.sleep(0.3)
+            gc.collect()
             return False
         st = wlan_sta.status()
         if st == 1000 and not issued:
@@ -1216,22 +1304,49 @@ def connect_wifi(cfg):
                 issued = True
         elif st in (201, 202, 203, 1002, 1003, 1004):
             # MicroPython ESP32 失败码：201=无AP 202=密码错/认证失败 203=连接失败
-            # （1002/1003/1004 为兼容保留）。断开重置后重试。
-            print("[wifi] connect fail status", st, "- reset and retry try#%d" % (tries + 1))
-            try:
-                wlan_sta.disconnect()
-            except Exception:
-                pass
-            time.sleep(2)
-            issued = False
-            start = now_ms()  # 重置完整超时预算，给每次尝试完整窗口
-            gc.collect()
+            # （1002/1003/1004 为兼容保留）。
+            if not issued:
+                # 已 disconnect 过但 status 仍滞留失败码（驱动不回 IDLE 1000）：
+                # 直接重发 connect，不能傻等 1000 —— 否则 203 无限重试死循环。
+                tries += 1
+                try:
+                    wlan_sta.connect(cfg["wifi_ssid"], cfg["wifi_password"])
+                    issued = True
+                    print("[wifi] reconnect on stale fail st=%d try#%d" % (st, tries))
+                except Exception as e:
+                    print("[wifi] reconnect issue err (ignore):", e)
+                    issued = True
+                gc.collect()
+            else:
+                # 已发出连接且收到失败码。esp-sha 瞬时内存压力下驱动会自行
+                # 重试握手（while 顶部观察窗）；首次见失败码只记录起点交给
+                # 观察窗静默等待，窗口耗尽仍停留失败码才 disconnect 重置。
+                if _fail_seen is None:
+                    _fail_seen = now_ms()
+                    print("[wifi] fail code", st,
+                          "- enter %.1fs settle window" % (FAIL_SETTLE_MS / 1000))
+                else:
+                    print("[wifi] fail code", st,
+                          "persisted >%.1fs - disconnect+retry try#%d"
+                          % (FAIL_SETTLE_MS / 1000, tries + 1))
+                    try:
+                        wlan_sta.disconnect()
+                    except Exception:
+                        pass
+                    time.sleep(4)
+                    issued = False
+                    _fail_seen = None
+                    start = now_ms()  # 重置完整超时预算，给每次尝试完整窗口
+                gc.collect()
         # 短轮询等待
         for _ in range(6):
             if wlan_sta.isconnected():
                 break
             time.sleep(0.5)
     print("WiFi connected:", wlan_sta.ifconfig()[0])
+    _sta_connected_once = True
+    _wifi_fail_streak = 0
+    _wifi_failed_this_boot = False
     return True
 
 
@@ -1242,7 +1357,7 @@ def led_set(on):
 
 def start_modbus(cfg):
     """连上 WiFi 后启动 Modbus 采集线程（TCP/RTU 二选一，独立线程不阻塞继电器主循环）"""
-    global mb_master
+    global mb_master, ModbusMaster, ModbusTCPMaster, HAS_MODBUS, HAS_MODBUS_TCP
     mb_cfg = cfg.get("modbus") or DEFAULT_MODBUS_CONFIG
     if not mb_cfg.get("enabled", True):
         print("[MAIN] Modbus disabled in config")
@@ -1257,12 +1372,28 @@ def start_modbus(cfg):
         mb_master = None
     try:
         if mode == "tcp":
-            if not HAS_MODBUS_TCP or not ModbusTCPMaster:
+            if not HAS_MODBUS_TCP or ModbusTCPMaster is None:
+                # 延迟 import：只在需要时加载 TCP 模块，省堆给线程栈
+                try:
+                    from modbus_tcp_master import ModbusTCPMaster
+                    HAS_MODBUS_TCP = True
+                except Exception as _e:
+                    HAS_MODBUS_TCP = False
+                    print("[MAIN] modbus_tcp_master import failed:", _e)
+            if not HAS_MODBUS_TCP or ModbusTCPMaster is None:
                 print("[MAIN] ModbusTCPMaster module not available, skip")
                 return False
             mb_master = ModbusTCPMaster(mb_cfg)
         else:
-            if not HAS_MODBUS or not ModbusMaster:
+            if not HAS_MODBUS or ModbusMaster is None:
+                # 延迟 import：RTU 模式才加载串口版模块
+                try:
+                    from modbus_master import ModbusMaster
+                    HAS_MODBUS = True
+                except Exception as _e:
+                    HAS_MODBUS = False
+                    print("[MAIN] modbus_master import failed:", _e)
+            if not HAS_MODBUS or ModbusMaster is None:
                 print("[MAIN] ModbusMaster (RTU) module not available, skip")
                 return False
             mb_master = ModbusMaster(mb_cfg)
@@ -1290,10 +1421,12 @@ def run_normal(cfg):
     if not connect_wifi(cfg):
         return False
 
-    # 连上 WiFi 后立即启动 Modbus 采集线程，避免阻塞继电器主循环
-    start_modbus(cfg)
-    # 同时启 HTTP 控制 API（端口 80），用于 broker 下行不通时的局域网直连
+    # 先启 HTTP（8KB 线程栈需连续内部 RAM，须在堆最宽松时分配——实测晚于
+    # Modbus 线程创建会 can't create thread），再启 Modbus（worker 自带 2s
+    # 错峰延迟，不会抢初始化窗口）。
     start_control_http(cfg)
+    # Modbus 采集线程（TCP/RTU 二选一，独立线程不阻塞继电器主循环）
+    start_modbus(cfg)
 
     interval_ms = max(1, int(cfg.get("report_interval", REPORT_INTERVAL_S))) * 1000
     last_report = 0
