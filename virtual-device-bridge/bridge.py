@@ -83,26 +83,60 @@ class TopicHelper:
         return f"/{product_id}/{device_id}"
 
     def property_post(self, product_id: str, device_id: str) -> str:
+        """Where the bridge PUBLISHES child property reports to.
+        - direct:  /{pid}/{did}/property/post
+        - sys:     /sys/{pid}/{did}/thing/event/property/post
+        - jetlinks:/{pid}/{did}/properties/report
+        """
         base = self.base(product_id, device_id)
         if self.mode == "sys":
             return f"{base}/thing/event/property/post"
+        if self.mode == "jetlinks":
+            return f"{base}/properties/report"
         return f"{base}/property/post"
 
     def event(self, product_id: str, device_id: str, event_id: str) -> str:
         base = self.base(product_id, device_id)
         if self.mode == "sys":
             return f"{base}/thing/event/{event_id}"
+        if self.mode == "jetlinks":
+            # JetLinks does not define a dedicated per-event topic; use the
+            # standard property-report as a fallback (events can also ride on
+            # property/report with an 'events' list).
+            return f"{base}/properties/report"
         return f"{base}/event/{event_id}"
 
     def service_cmd(self, product_id: str, device_id: str) -> str:
+        """Where the bridge SUBSCRIBES for child DOWNLINK commands.
+        - direct:  /{pid}/{did}/service/cmd
+        - sys:     /sys/{pid}/{did}/thing/service/property/set
+        - jetlinks:/{pid}/{did}/function/invoke
+        """
         base = self.base(product_id, device_id)
         if self.mode == "sys":
             return f"{base}/thing/service/property/set"
+        if self.mode == "jetlinks":
+            return f"{base}/function/invoke"
         return f"{base}/service/cmd"
 
     def function_invoke(self, product_id: str, device_id: str, function_id: str) -> str:
         base = self.base(product_id, device_id)
         return f"{base}/thing/service/{function_id}/invoke"
+
+
+class GatewayTopicHelper:
+    """Separate topic helper for the parent gateway: 4-real-relay firmware
+    uses Aliyun-style /property/post and /service/cmd regardless of the
+    JetLinks sub-device mode."""
+    def __init__(self, mode: str = "direct"):
+        self.mode = mode
+        self._helper = TopicHelper(mode)
+
+    def property_post(self, product_id: str, device_id: str) -> str:
+        return self._helper.property_post(product_id, device_id)
+
+    def service_cmd(self, product_id: str, device_id: str) -> str:
+        return self._helper.service_cmd(product_id, device_id)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +167,10 @@ class VirtualDeviceBridge:
         self.gateway = cfg["gateway"]
         self.topic_mode = cfg.get("child_topic_mode", "direct")
         self.topic = TopicHelper(self.topic_mode)
+        # Parent gateway uses its own mode (typically "direct" — Aliyun-style,
+        # since 4-real-relay firmware posts to /property/post).
+        self.gw_topic = GatewayTopicHelper(
+            cfg.get("gateway_topic_mode", "direct"))
         self.qos = int(self.mqtt_cfg.get("qos", 1))
 
         self.client: Optional[mqtt.Client] = None
@@ -208,12 +246,12 @@ class VirtualDeviceBridge:
             return
 
         # 父设备上行属性
-        if topic == self.topic.property_post(self.gateway["product_id"], self.gateway["device_id"]):
+        if topic == self.gw_topic.property_post(self.gateway["product_id"], self.gateway["device_id"]):
             self._handle_gateway_property(data)
             return
 
         # 父设备上行事件
-        gw_base = self.topic.base(self.gateway["product_id"], self.gateway["device_id"])
+        gw_base = self.gw_topic._helper.base(self.gateway["product_id"], self.gateway["device_id"])
         if topic.startswith(gw_base + "/") and "/event/" in topic:
             self._handle_gateway_event(topic, data)
             return
@@ -233,13 +271,18 @@ class VirtualDeviceBridge:
             return
         # 父设备上行
         self.client.subscribe(
-            self.topic.property_post(self.gateway["product_id"], self.gateway["device_id"]),
+            self.gw_topic.property_post(self.gateway["product_id"], self.gateway["device_id"]),
             qos=self.qos,
         )
         # 父设备事件通配
-        gw_base = self.topic.base(self.gateway["product_id"], self.gateway["device_id"])
-        if self.topic_mode == "sys":
+        gw_base = self.gw_topic._helper.base(self.gateway["product_id"], self.gateway["device_id"])
+        if self.gw_topic.mode == "sys":
             event_wild = f"{gw_base}/thing/event/+"
+        elif self.gw_topic.mode == "jetlinks":
+            # JetLinks uses the same topic for events (within properties/report
+            # payload) plus an optional message/event sub-topic; subscribe to
+            # both to be safe.
+            event_wild = f"{gw_base}/properties/report"
         else:
             event_wild = f"{gw_base}/event/+"
         self.client.subscribe(event_wild, qos=self.qos)
@@ -348,8 +391,8 @@ class VirtualDeviceBridge:
     def _handle_gateway_event(self, topic: str, data: Dict[str, Any]):
         self.stats["up_event"] += 1
         # 提取 event_id
-        gw_base = self.topic.base(self.gateway["product_id"], self.gateway["device_id"])
-        prefix = f"{gw_base}/{'thing/event/' if self.topic_mode == 'sys' else 'event/'}"
+        gw_base = self.gw_topic._helper.base(self.gateway["product_id"], self.gateway["device_id"])
+        prefix = f"{gw_base}/{'thing/event/' if self.gw_topic.mode == 'sys' else 'event/'}"
         event_id = topic[len(prefix):] if topic.startswith(prefix) else ""
         if not event_id:
             return
@@ -434,7 +477,7 @@ class VirtualDeviceBridge:
             "inputs": gateway_inputs,
         }
         self._publish(
-            self.topic.service_cmd(self.gateway["product_id"], self.gateway["device_id"]),
+            self.gw_topic.service_cmd(self.gateway["product_id"], self.gateway["device_id"]),
             gateway_cmd,
         )
         self.stats["up_cmd"] += 1

@@ -39,3 +39,7 @@ firmware-simtest/flash_modbus/_*.py
 /virtual-device-bridge/_*.log
 /virtual-device-bridge/_*.pid
 /virtual-device-bridge/__pycache__/
+/_snapshot/
+/_setup_*.py
+/_bridge_step*.log
+/_bridge_*.log

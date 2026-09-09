@@ -12,25 +12,28 @@ mqtt:
   # QoS，保持 1 可防止网络抖动时丢命令
   qos: 1
 
-# 父网关设备（真实继电器/Modbus 网关）
+# 父网关设备（真实继电器/Modbus 网关，4-real-relay 固件）
 gateway:
   product_id: "relay4-modbus-gateway"
   device_id: "7ce8b1c1a7fc"
+  # 4-real-relay 固件沿用 Aliyun/OneNet 风格 topic，与子设备用的 JetLinks 风格分开
+  topic_mode: "direct"
 
 # 子设备 topic 模式：与 JetLinks 物模型对齐
-# "direct"  -> /{product_id}/{device_id}/property/post
-# "sys"     -> /{product_id}/{device_id}/thing/event/property/post
-child_topic_mode: "direct"
+# "jetlinks" -> /{product_id}/{device_id}/properties/report   （JetLinks 标准，2026-09-09 实测通过）
+# "direct"   -> /{product_id}/{device_id}/property/post        （Aliyun/OneNet 风格）
+child_topic_mode: "jetlinks"
 
 # ---------------- 继电器通道 → 虚拟设备 ----------------
-# 规则：
-#   property_map : 父设备 properties 里的 key -> 子设备属性 key
-#   event_map    : 父设备事件 -> 子设备事件
-#   command_map  : 子设备 functionId/method -> 网关命令
+# 注：product_id/device_id 对应 admin5 在 JetLinks 172.16.4.211:9000 上已创建的
+# 7 个 lfx 后缀子设备（2026-09-09），实测它们在
+# `/{product_id}/{device_id}/properties/report` 上报即可被 JetLinks 接收并入库。
+# 命令下行通过 `/api/device-instance/{did}/property/_write`（不需要产品物模型里有
+# functions 段，对应一个 property write 即可）。
 relays:
   - channel: 1
-    product_id: "virtual-lock"
-    device_id: "lock-001"
+    product_id: "lock-lfx"
+    device_id: "lock-001-lfx"
     name: "门锁"
     property_map:
       ch1_state: lockState
@@ -54,8 +57,8 @@ relays:
           state: "{value}"
 
   - channel: 2
-    product_id: "virtual-light"
-    device_id: "light-001"
+    product_id: "light-lfx-1"
+    device_id: "light-001-lfx"
     name: "灯1"
     property_map:
       ch2_state: switch
@@ -80,8 +83,8 @@ relays:
           state: false
 
   - channel: 3
-    product_id: "virtual-light"
-    device_id: "light-002"
+    product_id: "light-lfx-2"
+    device_id: "light-002-lfx"
     name: "灯2"
     property_map:
       ch3_state: switch
@@ -106,8 +109,8 @@ relays:
           state: false
 
   - channel: 4
-    product_id: "virtual-ac"
-    device_id: "ac-001"
+    product_id: "ac-lfx"
+    device_id: "ac-001-lfx"
     name: "空调开关"
     property_map:
       ch4_state: powerState
@@ -129,8 +132,8 @@ relays:
 #   2) 通配前缀：s1_* 表示把从站 1 所有 key 映射到同一子设备
 sensors:
   # 真实 Modbus 从站 1（温湿度）
-  - product_id: "virtual-th"
-    device_id: "th-001"
+  - product_id: "th-lfx"
+    device_id: "th-001-lfx"
     name: "温湿度传感器"
     # 把父设备里的 s1_temperature / s1_humidity 等转发到本设备
     source_pattern: "s1_*"
@@ -141,8 +144,8 @@ sensors:
 # ---------------- 模拟传感器（不依赖真实硬件） ----------------
 # 由桥接器内部定时生成属性并上报，用于演示多设备场景
 simulated:
-  - product_id: "virtual-pir"
-    device_id: "pir-001"
+  - product_id: "pir-lfx"
+    device_id: "pir-001-lfx"
     name: "人体感应器"
     interval_seconds: 5
     properties:
@@ -151,8 +154,8 @@ simulated:
         choices: [0, 1]
         weights: [0.75, 0.25]
 
-  - product_id: "virtual-smoke"
-    device_id: "smoke-001"
+  - product_id: "smoke-lfx"
+    device_id: "smoke-001-lfx"
     name: "烟雾感应器"
     interval_seconds: 10
     properties:
