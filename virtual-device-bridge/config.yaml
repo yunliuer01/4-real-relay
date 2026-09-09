@@ -35,7 +35,7 @@ child_topic_mode: "jetlinks"
 relays:
   - channel: 1
     product_id: "lock-lfx"
-    device_id: "lock-001-lfx"
+    device_id: "lock-002-lfx"
     name: "门锁"
     property_map:
       ch1_state: lockState
@@ -60,7 +60,7 @@ relays:
 
   - channel: 2
     product_id: "light-lfx-1"
-    device_id: "light-001-lfx"
+    device_id: "light-003-lfx"
     name: "灯1"
     property_map:
       ch2_state: switch
@@ -86,7 +86,7 @@ relays:
 
   - channel: 3
     product_id: "light-lfx-2"
-    device_id: "light-002-lfx"
+    device_id: "light-004-lfx"
     name: "灯2"
     property_map:
       ch3_state: switch
@@ -112,7 +112,7 @@ relays:
 
   - channel: 4
     product_id: "ac-lfx"
-    device_id: "ac-001-lfx"
+    device_id: "ac-002-lfx"
     name: "空调开关"
     property_map:
       ch4_state: powerState

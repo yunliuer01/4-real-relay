@@ -327,7 +327,8 @@ class VirtualDeviceBridge:
         if not isinstance(parent_props, dict):
             return
 
-        ts = data.get("timestamp") or int(time.time() * 1000)
+        # 方案A：强制用本机(PC)时间，避免固件 RTC 时间错误(如 2031 年)污染 JetLinks 属性时间
+        ts = int(time.time() * 1000)
 
         # 1) 继电器通道属性：按 property_map 拆到 4 个子设备
         child_props: Dict[str, Dict[str, Any]] = defaultdict(dict)
@@ -422,7 +423,7 @@ class VirtualDeviceBridge:
         payload = {
             "productId": r["product_id"],
             "deviceId": r["device_id"],
-            "timestamp": data.get("timestamp") or int(time.time() * 1000),
+            "timestamp": int(time.time() * 1000),  # 方案A：沿用本机时间，忽略固件时间戳
             "eventId": child_event_id,
             "data": child_data,
         }
