@@ -118,8 +118,11 @@ class WLAN:
         return _sta_ifconfig if self._iface == STA_IF else _ap_ifconfig
 
     def status(self, *a):
+        # 固件 connect_wifi 用「status()==1000(驱动空闲)才发起 connect」做门控，
+        # 纯 bool 会永远不等于 1000 导致连接永不发起（曾致仿真 WiFi 超时）。
+        # 约定：未连接=1000(IDLE，允许发起 connect)，已连接=1005(非门控/非失败码)。
         if self._iface == STA_IF:
-            return _sta_connected
+            return 1000 if not _sta_connected else 1005
         return True
 
     def scan(self):

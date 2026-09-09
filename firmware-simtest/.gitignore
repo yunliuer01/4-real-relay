@@ -1,3 +1,8 @@
-# 运行产生的“虚拟 flash”（模拟设备存储，运行 run_sim.py 时生成）
+# 运行产生的"虚拟 flash"（模拟设备存储）
 flash/
+flash_modbus/
+flash_modbus_tcp/
 __pycache__/
+_run_tcp_result.txt
+# 一次性调试脚本（硬编码本机路径，不入库）
+_dbg_*.py
