@@ -1,32 +1,23 @@
-import re, json, sys
+import json, sys
 
-with open('main.py', 'r', encoding='utf-8') as f:
-    src = f.read()
-
-# 提取 PAGE 多行字符串
-m = re.search(r'PAGE = """(.*?)"""', src, re.DOTALL)
-if not m:
-    print("PAGE not found")
-    sys.exit(1)
-
-PAGE = m.group(1)
+with open('portal_page.html', 'r', encoding='utf-8') as f:
+    PAGE = f.read()
 
 sample_mb = {
     "enabled": True,
-    "uart_id": 1, "baudrate": 9600, "tx_pin": 20, "rx_pin": 21, "dir_pin": 8,
-    "timeout_ms": 500, "retries": 2, "retry_interval_ms": 500,
+    "mode": "tcp",
+    "timeout_ms": 500,
+    "retries": 2,
+    "retry_interval_ms": 500,
     "slaves": [
         {
-            "slave_id": 1, "enabled": True,
+            "enabled": True,
+            "host": "192.168.20.59",
+            "port": 5502,
+            "unit_id": 4,
             "registers": [
-                {"addr": 0, "func": 3, "key": "temperature", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2},
-                {"addr": 1, "func": 3, "key": "humidity", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2},
-            ]
-        },
-        {
-            "slave_id": 2, "enabled": True,
-            "registers": [
-                {"addr": 5, "func": 4, "key": "soil_moisture", "scale": 1, "period_ms": 3000, "signed": False, "digits": 0},
+                {"addr": 3, "func": 3, "key": "temperature", "product": "th-lfx", "period_ms": 2000, "scale": 1, "digits": 0, "signed": False, "writable": True},
+                {"addr": 4, "func": 3, "key": "humidity", "product": "th-lfx", "period_ms": 2000, "scale": 1, "digits": 0, "signed": False, "writable": True},
             ]
         }
     ]

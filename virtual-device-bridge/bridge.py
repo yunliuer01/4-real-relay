@@ -59,8 +59,9 @@ def load_config(path: str = "config.yaml") -> Dict[str, Any]:
     cfg["mqtt"].setdefault("qos", 1)
 
     cfg.setdefault("gateway", {})
-    cfg["gateway"].setdefault("product_id", "relay4-modbus-gateway")
-    cfg["gateway"].setdefault("device_id", "gateway-01")
+    # 默认只关联本组（admin5 / -lfx）在 JetLinks 上创建的产品与设备，避免误连其他组资源
+    cfg["gateway"].setdefault("product_id", "relay4_lfx")
+    cfg["gateway"].setdefault("device_id", "7ce8b1c1a7fc")
 
     cfg.setdefault("child_topic_mode", "direct")
     cfg.setdefault("relays", [])

@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
-"""4 路继电器 + Modbus RTU 采集网关 v2.0 (MicroPython / ESP32-C3)
+"""4 路继电器 + Modbus TCP/RTU 采集网关 v3.0 (MicroPython / ESP32-C3)
 
 功能：
 - 配网模式：长按 SW1 5 秒进入 AP 热点，IP 192.168.4.1，Web 配置 MQTT/产品/设备/Modbus 参数
 - 正常模式：连 WiFi → 连 MQTT → 按 JetLinks 协议上报属性/事件/响应命令
-- Modbus RTU 主站：独立线程轮询多从站、多寄存器，不阻塞继电器控制
+- Modbus TCP 主站：独立线程轮询多从站（host/port/unit_id）、多寄存器，不阻塞继电器控制
 - 持久化：配置写入 flash /config.json，掉电不丢失
 - 断线重连：WiFi/MQTT 均支持自动重连
-- HTTP 控制 API：STA 模式下端口 80，可直连控制继电器 / 模拟 SW1 动作（无杜邦线时也能裸测按钮）
+- HTTP 控制 API：STA 模式下端口 80，可直连控制继电器 / 模拟 SW1 动作 / 读写 Modbus 寄存器
 
 硬件接线（CORE-ESP32-C3 四路继电器板）：
 - 继电器低电平吸合：RELAY1=IO3, RELAY2=IO4, RELAY3=IO5, RELAY4=IO7
 - SW1 按键：IO10，上拉输入，按下为低电平（长按 5 秒进配网）
 - SW 按键：IO9（板上 BOOT 按钮同脚；运行时为普通 GPIO 可作按钮用，注意 boot 期间按下会进 download mode）
 - LED 指示灯：IO2
-- Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8
+- 保留 Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8（mode=rtu 时启用）
+- Modbus TCP：通过 STA WiFi 走 socket，无需额外硬件接线
 """
 import json
 import os
@@ -24,7 +25,15 @@ import time
 import machine
 from machine import Pin, reset
 
-# 如果 modbus_master.py 已经上传到板子，则导入；否则给出占位对象，避免 main.py 直接崩溃
+# 如果 modbus 模块已经上传到板子，则导入；否则给出占位对象，避免 main.py 直接崩溃
+try:
+    from modbus_tcp_master import ModbusTCPMaster
+    HAS_MODBUS_TCP = True
+except Exception as _e:
+    print("[MAIN] modbus_tcp_master import failed:", _e)
+    ModbusTCPMaster = None
+    HAS_MODBUS_TCP = False
+
 try:
     from modbus_master import ModbusMaster
     HAS_MODBUS = True
@@ -63,22 +72,22 @@ CONFIG_PATH = "config.json"
 # 改为写此标志 -> machine.reset() -> 上电干净环境（无线程）检测到标志直接进配网。
 PORTAL_FLAG = "/portal.flag"
 
-# 默认 Modbus 采集配置示例：从站 1 的 0x0000 -> temperature, 0x0001 -> humidity
+# 默认 Modbus TCP 采集配置示例：从站 1 的 0x0000 -> temperature, 0x0001 -> humidity
 DEFAULT_MODBUS_CONFIG = {
     "enabled": True,
-    "uart_id": 1,
-    "baudrate": 9600,
-    "tx_pin": 20,
-    "rx_pin": 21,
-    "dir_pin": 8,
+    "mode": "tcp",
     "timeout_ms": 500,
     "retries": 2,
+    "retry_interval_ms": 500,
     "slaves": [
         {
-            "slave_id": 1,
+            "enabled": True,
+            "host": "192.168.20.59",
+            "port": 5502,
+            "unit_id": 1,
             "registers": [
-                {"addr": 0, "func": 3, "key": "temperature", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2},
-                {"addr": 1, "func": 3, "key": "humidity", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2},
+                {"addr": 0, "func": 3, "key": "temperature", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2, "writable": False, "product": ""},
+                {"addr": 1, "func": 3, "key": "humidity", "scale": 0.1, "period_ms": 1000, "signed": False, "digits": 2, "writable": False, "product": ""},
             ]
         }
     ]
@@ -143,6 +152,14 @@ def load_config():
         cfg = {}
     out = dict(DEFAULT_CONFIG)
     out.update({k: cfg[k] for k in DEFAULT_CONFIG if k in cfg})
+    # Modbus 配置兼容：无 mode 字段时按 uart_id 判断旧 RTU，否则默认 tcp
+    mb = out.get("modbus") or DEFAULT_MODBUS_CONFIG
+    if isinstance(mb, dict) and not mb.get("mode"):
+        if mb.get("uart_id") is not None:
+            mb["mode"] = "rtu"
+        else:
+            mb["mode"] = "tcp"
+        out["modbus"] = mb
     if not out["device_id"]:
         out["device_id"] = default_device_id()
     if not out["mqtt_user"]:
@@ -575,6 +592,28 @@ def handle_command(data, function_id=None):
             publish_reply(cfg, message_id, False, False, function_id)
             return
         changed = set_all_relay(state)
+    elif method == "write_register":
+        # Modbus TCP 写单个保持寄存器（功能码 06）
+        try:
+            slave_idx = int(args.get("slave_idx", 0))
+            addr = int(args.get("addr", 0))
+            value = int(args.get("value", 0))
+        except (TypeError, ValueError):
+            publish_reply(cfg, message_id, False, False, function_id)
+            return
+        mb_cfg = cfg.get("modbus") or DEFAULT_MODBUS_CONFIG
+        slaves = mb_cfg.get("slaves", [])
+        if not (0 <= slave_idx < len(slaves)):
+            publish_reply(cfg, message_id, False, False, function_id)
+            return
+        if mb_master is None or not hasattr(mb_master, "write_register"):
+            publish_reply(cfg, message_id, False, False, function_id)
+            return
+        ok, err = mb_master.write_register(slave_idx, slaves[slave_idx], addr, value)
+        if not ok:
+            print("[MAIN] write_register failed:", err)
+        publish_reply(cfg, message_id, ok, ok, function_id)
+        return
     else:
         print("unknown function:", method)
         publish_reply(cfg, message_id, False, False, function_id)
@@ -881,7 +920,34 @@ def http_api_handler(cfg, conn):
         _http_json(conn, "200 OK", {"ok": True, "values": values})
         return
 
-    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short /api/sw?action=short /api/modbus_values)")
+    if path == "/api/modbus_write" or path.startswith("/api/modbus_write?"):
+        # HTTP 调试：写单个保持寄存器 ?slave_idx=0&addr=0&value=123
+        q = _parse_query(path)
+        try:
+            slave_idx = int(q.get("slave_idx", 0))
+            addr = int(q.get("addr", 0))
+            value = int(q.get("value", 0))
+        except (TypeError, ValueError):
+            _http_json(conn, "400 Bad Request",
+                       {"ok": False, "err": "need slave_idx, addr, value"})
+            return
+        cfg = load_config()
+        mb_cfg = cfg.get("modbus") or DEFAULT_MODBUS_CONFIG
+        slaves = mb_cfg.get("slaves", [])
+        if not (0 <= slave_idx < len(slaves)):
+            _http_json(conn, "400 Bad Request",
+                       {"ok": False, "err": "slave_idx out of range"})
+            return
+        if mb_master is None or not hasattr(mb_master, "write_register"):
+            _http_json(conn, "503 Service Unavailable",
+                       {"ok": False, "err": "modbus write not available"})
+            return
+        ok, err = mb_master.write_register(slave_idx, slaves[slave_idx], addr, value)
+        _http_json(conn, "200 OK" if ok else "500 Internal Server Error",
+                   {"ok": ok, "slave_idx": slave_idx, "addr": addr, "value": value, "err": err})
+        return
+
+    http_send(conn, "404 Not Found", "404 (try /api/status /api/info /api/relay?ch=1&state=1 /api/sw1?action=short /api/sw?action=short /api/modbus_values /api/modbus_write?slave_idx=0&addr=0&value=0)")
 
 
 def _read_request(conn):
@@ -1175,15 +1241,13 @@ def led_set(on):
 
 
 def start_modbus(cfg):
-    """连上 WiFi 后启动 Modbus 采集线程（UART 不依赖 WiFi，但在这里启动便于现场日志查看）"""
+    """连上 WiFi 后启动 Modbus 采集线程（TCP/RTU 二选一，独立线程不阻塞继电器主循环）"""
     global mb_master
-    if not HAS_MODBUS or not ModbusMaster:
-        print("[MAIN] Modbus module not available, skip")
-        return False
     mb_cfg = cfg.get("modbus") or DEFAULT_MODBUS_CONFIG
     if not mb_cfg.get("enabled", True):
         print("[MAIN] Modbus disabled in config")
         return False
+    mode = mb_cfg.get("mode", "tcp")
     # 如果已经启动过则先停止，再重新初始化（配置可能已变）
     if mb_master is not None:
         try:
@@ -1192,9 +1256,18 @@ def start_modbus(cfg):
             print("[MAIN] stop old modbus master error:", e)
         mb_master = None
     try:
-        mb_master = ModbusMaster(mb_cfg)
+        if mode == "tcp":
+            if not HAS_MODBUS_TCP or not ModbusTCPMaster:
+                print("[MAIN] ModbusTCPMaster module not available, skip")
+                return False
+            mb_master = ModbusTCPMaster(mb_cfg)
+        else:
+            if not HAS_MODBUS or not ModbusMaster:
+                print("[MAIN] ModbusMaster (RTU) module not available, skip")
+                return False
+            mb_master = ModbusMaster(mb_cfg)
         ok = mb_master.init_hw() and mb_master.start()
-        print("[MAIN] start_modbus result:", ok)
+        print("[MAIN] start_modbus mode=%s result:" % mode, ok)
         return ok
     except Exception as e:
         print("[MAIN] start_modbus exception:", e)

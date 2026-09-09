@@ -1,8 +1,10 @@
-# 4 路继电器 + Modbus RTU 采集网关（MicroPython / ESP32-C3）
+# 4 路继电器 + Modbus TCP/RTU 采集网关（MicroPython / ESP32-C3）
 
 固件文件：
 - `main.py`：主程序（配网、WiFi、MQTT、继电器、Modbus 线程调度）
-- `modbus_master.py`：Modbus RTU 主站，独立线程运行，不阻塞继电器
+- `modbus_tcp_master.py`：Modbus TCP 主站，独立线程运行，不阻塞继电器
+- `modbus_master.py`：Modbus RTU 主站（保留，mode=rtu 时启用）
+- `portal_page.html`：AP 配网 Web 页面（部署到设备上为 `portal.html`）
 
 ## 功能特性
 
@@ -10,10 +12,13 @@
 - **参数持久化**：配置保存到板载 flash `/config.json`，掉电不丢失。
 - **正常运行模式**：连上 WiFi 后自动连接 MQTT，按 JetLinks 协议上报属性、事件、命令回复；支持断线自动重连。
 - **4 路继电器控制**：支持 `set_channel`（单路）、`switch_all`（全路），状态变化触发 `switch_change` 事件。
-- **Modbus RTU 采集网关**：
-  - 支持多从站、多寄存器独立配置采集周期
+- **Modbus TCP 采集网关**：
+  - 作为 Modbus TCP 客户端，采集多个服务器/从站的保持/输入寄存器
+  - 每个从站独立配置 `host` / `port` / `unit_id`
+  - 每个从站可挂多个寄存器，独立配置采集周期、上报 key、上报产品、可写标志
   - 采集线程独立运行，不阻塞继电器控制与 MQTT 命令响应
   - 采集结果自动合并到属性上报中，支持 `scale`、`signed`、`digits` 等转换
+  - 支持通过 MQTT / HTTP 写单个保持寄存器（功能码 06）
 - **双 Topic 模式**：
   - `direct`（默认）：沿用 EMQX 规则路径，如 `/{productId}/{deviceId}/property/post`
   - `sys`：JetLinks MQTT 网关规范路径，如 `/sys/{productId}/{deviceId}/thing/event/property/post`
@@ -76,11 +81,17 @@ python -m esptool --port COMx --chip esp32-c3 erase_flash
 # 2. 写入 MicroPython 固件
 python -m esptool --port COMx --chip esp32-c3 --baud 460800 write_flash -z 0x0 "D:\8-relay\esp32-relay4-modbus-gateway\LOLIN_C3_MINI-20241025-v1.24.0.bin"
 
-# 3. 上传 modbus_master.py
+# 3. 上传 modbus_tcp_master.py
+python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\modbus_tcp_master.py" :modbus_tcp_master.py
+
+# 4. 上传 modbus_master.py（保留 RTU 模式回退）
 python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\modbus_master.py" :modbus_master.py
 
-# 4. 上传 main.py
+# 5. 上传 main.py
 python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\main.py" :main.py
+
+# 6. 上传 portal.html（配网页面）
+python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\portal_page.html" :portal.html
 ```
 
 5. **按 RST 复位**，串口输出日志即开始运行。
@@ -96,37 +107,31 @@ python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\ma
    - 产品 ID（默认 `relay4_lfx`）
    - 设备 ID（默认读取 MAC 地址，可修改）
    - 主题模式：选 `direct`（对接现有 EMQX 规则）或 `sys`
-   - 上报周期（默认 5 秒）
-   - **Modbus 配置 JSON**：可配置多从站、多寄存器、采集周期、scale 等
+- 上报周期（默认 5 秒）
+  - **Modbus TCP 配置**：在 Web 页面直接添加从站、寄存器，自动保存为 JSON
 3. 点击保存 → 设备写入 `/config.json` 并自动重启。
 4. 设备连上 WiFi 和 MQTT 后，在 JetLinks 平台即可看到设备上线、属性上报、命令执行。
 
-## Modbus 配置示例
+## Modbus TCP 配置示例
 
-在配网页面的 "Modbus RTU 采集网关配置" 文本框中填写：
+在配网页面 "Modbus TCP 采集网关配置" 中配置：
 
 ```json
 {
   "enabled": true,
-  "uart_id": 1,
-  "baudrate": 9600,
-  "tx_pin": 20,
-  "rx_pin": 21,
-  "dir_pin": 8,
+  "mode": "tcp",
   "timeout_ms": 500,
   "retries": 2,
+  "retry_interval_ms": 500,
   "slaves": [
     {
-      "slave_id": 1,
+      "enabled": true,
+      "host": "192.168.20.59",
+      "port": 5502,
+      "unit_id": 4,
       "registers": [
-        {"addr": 0, "func": 3, "key": "temperature", "scale": 0.1, "period_ms": 1000, "signed": false, "digits": 2},
-        {"addr": 1, "func": 3, "key": "humidity", "scale": 0.1, "period_ms": 1000, "signed": false, "digits": 2}
-      ]
-    },
-    {
-      "slave_id": 2,
-      "registers": [
-        {"addr": 5, "func": 3, "key": "co2", "scale": 1.0, "period_ms": 2000, "signed": false, "digits": 0}
+        {"addr": 3, "func": 3, "key": "temperature", "product": "th-lfx", "period_ms": 2000, "scale": 1, "signed": false, "digits": 0, "writable": true},
+        {"addr": 4, "func": 3, "key": "humidity", "product": "th-lfx", "period_ms": 2000, "scale": 1, "signed": false, "digits": 0, "writable": true}
       ]
     }
   ]
@@ -138,21 +143,22 @@ python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\ma
 | 字段 | 含义 |
 |------|------|
 | `enabled` | 是否启用 Modbus 采集 |
-| `uart_id` | ESP32 UART 编号（通常 1） |
-| `tx_pin` / `rx_pin` | UART TX / RX GPIO |
-| `dir_pin` | RS485 DE/RE 方向控制 GPIO；若为自动方向模块可填 `null` |
+| `mode` | `"tcp"` 或 `"rtu"` |
 | `timeout_ms` | 单帧等待超时 |
 | `retries` | 失败重试次数 |
+| `retry_interval_ms` | 重试间隔 |
 | `slaves` | 从站列表 |
-| `slave_id` | Modbus 从站地址 |
+| `host` / `port` / `unit_id` | Modbus TCP 服务器 IP、端口、单元 ID |
 | `registers` | 该从站要采集的寄存器列表 |
 | `addr` | 寄存器地址（十进制，如 0 对应 0x0000） |
 | `func` | 功能码（3=保持寄存器，4=输入寄存器） |
 | `key` | 上报到 JetLinks 的 JSON 属性名 |
+| `product` | 上报产品标识（仅用于虚拟设备桥接标注；只填本组自己的产品，如 `th-lfx`，留空则采集值随本网关 `relay4_lfx` 一并上报。不要填其他组的产品） |
 | `scale` | 原始值缩放系数 |
 | `period_ms` | 该寄存器采集周期 |
 | `signed` | 是否按有符号 16 位解析 |
 | `digits` | 结果保留小数位数 |
+| `writable` | 是否允许平台写回该寄存器 |
 
 ## MQTT Topic 说明
 

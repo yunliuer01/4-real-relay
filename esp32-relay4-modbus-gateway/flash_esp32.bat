@@ -8,7 +8,9 @@ rem Example: flash_esp32.bat COM3
 set BASE=D:\8-relay\esp32-relay4-modbus-gateway
 set FIRMWARE=%BASE%\LOLIN_C3_MINI-20241025-v1.24.0.bin
 set MAINPY=%BASE%\main.py
+set PORTALHTML=%BASE%\portal_page.html
 set MODBUSPY=%BASE%\modbus_master.py
+set MODBUSTCPP=%BASE%\modbus_tcp_master.py
 set PYTHON=C:\Users\yunliu\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
 if "%~1"=="" (
@@ -39,8 +41,17 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/4] Waiting for board to reset, then uploading modbus_master.py
+echo [3/6] Waiting for board to reset, then uploading modbus_tcp_master.py
 timeout /t 3 /nobreak >nul
+"%PYTHON%" -m mpremote connect %PORT% fs cp "%MODBUSTCPP%" :modbus_tcp_master.py
+if errorlevel 1 (
+    echo modbus_tcp_master.py upload failed. Reset the board and run:
+    echo   %PYTHON% -m mpremote connect %PORT% fs cp "%MODBUSTCPP%" :modbus_tcp_master.py
+    exit /b 1
+)
+
+echo.
+echo [4/6] Uploading modbus_master.py
 "%PYTHON%" -m mpremote connect %PORT% fs cp "%MODBUSPY%" :modbus_master.py
 if errorlevel 1 (
     echo modbus_master.py upload failed. Reset the board and run:
@@ -49,11 +60,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4/4] Uploading main.py
+echo [5/6] Uploading main.py
 "%PYTHON%" -m mpremote connect %PORT% fs cp "%MAINPY%" :main.py
 if errorlevel 1 (
     echo main.py upload failed. Reset the board and run:
     echo   %PYTHON% -m mpremote connect %PORT% fs cp "%MAINPY%" :main.py
+    exit /b 1
+)
+
+echo.
+echo [6/6] Uploading portal.html
+"%PYTHON%" -m mpremote connect %PORT% fs cp "%PORTALHTML%" :portal.html
+if errorlevel 1 (
+    echo portal.html upload failed. Reset the board and run:
+    echo   %PYTHON% -m mpremote connect %PORT% fs cp "%PORTALHTML%" :portal.html
     exit /b 1
 )
 
