@@ -13,8 +13,10 @@ mqtt:
   qos: 1
 
 # 父网关设备（真实继电器/Modbus 网关，4-real-relay 固件）
+# 板子固件里 product_id 字段由用户在 portal 网页配置；admin5 在 2026-09-09
+# 已把它配成 "relay4_lfx"，与 JetLinks 上 admin5 创建的 `relay4_lfx` 产品一致。
 gateway:
-  product_id: "relay4-modbus-gateway"
+  product_id: "relay4_lfx"
   device_id: "7ce8b1c1a7fc"
   # 4-real-relay 固件沿用 Aliyun/OneNet 风格 topic，与子设备用的 JetLinks 风格分开
   topic_mode: "direct"
