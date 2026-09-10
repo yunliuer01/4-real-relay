@@ -31,9 +31,8 @@ import yaml
 
 try:
     import paho.mqtt.client as mqtt
-    from paho.mqtt.enums import CallbackAPIVersion
 except ImportError as e:  # pragma: no cover
-    sys.exit("缺少 paho-mqtt，请先执行: pip install paho-mqtt>=2.0 pyyaml")
+    sys.exit("缺少 paho-mqtt，请先执行: pip install paho-mqtt>=1.5 pyyaml")
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -226,7 +225,7 @@ class VirtualDeviceBridge:
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
             self.connected = True
-            log("INFO", "MQTT connected")
+            log("INFO", f"MQTT connected (flags={flags})")
             self._subscribe_all()
         else:
             self.connected = False
@@ -271,10 +270,11 @@ class VirtualDeviceBridge:
         if not self.client:
             return
         # 父设备上行
-        self.client.subscribe(
+        r1 = self.client.subscribe(
             self.gw_topic.property_post(self.gateway["product_id"], self.gateway["device_id"]),
             qos=self.qos,
         )
+        log("INFO", f"sub parent {self.gw_topic.property_post(self.gateway['product_id'], self.gateway['device_id'])} -> result={r1}")
         # 父设备事件通配
         gw_base = self.gw_topic._helper.base(self.gateway["product_id"], self.gateway["device_id"])
         if self.gw_topic.mode == "sys":
@@ -293,15 +293,26 @@ class VirtualDeviceBridge:
             if not r.get("command_map"):
                 continue
             cmd_topic = self.topic.service_cmd(r["product_id"], r["device_id"])
-            self.client.subscribe(cmd_topic, qos=self.qos)
-            log("INFO", f"subscribe child cmd: {cmd_topic}")
+            rs = self.client.subscribe(cmd_topic, qos=self.qos)
+            log("INFO", f"subscribe child cmd: {cmd_topic} -> result={rs}")
 
         log("INFO", f"subscribed parent property & events, child commands")
 
     def connect(self):
+        # 2026-09-10 端到端验证通过（v6.0.3），要点记录：
+        # 1) JetLinks 平台真实下行 topic 是「带前导斜杠」的
+        #    /{productId}/{deviceId}/function/invoke，与本文件 service_cmd()
+        #    构造一致。此前"收不到下行"的误诊源于诊断脚本发的是不带斜杠的
+        #    topic（MQTT 里是两个不同 topic）。
+        # 2) client_id 拼上 PID：调试期间曾出现同机多个 bridge 进程共用同一
+        #    client_id 被 broker 互踢的情况，加 PID 后天然不冲突。
+        # 3) 使用 paho v1 默认 API（回调签名 v1 风格）；paho>=2 装了也能跑，
+        #    只是打 DeprecationWarning。
+        base_client_id = self.mqtt_cfg["client_id"]
+        final_client_id = f"{base_client_id}-{os.getpid()}"
+        log("INFO", f"this process PID={os.getpid()} using client_id={final_client_id}")
         self.client = mqtt.Client(
-            CallbackAPIVersion.VERSION2,
-            client_id=self.mqtt_cfg["client_id"],
+            client_id=final_client_id,
             clean_session=True,
         )
         user = self.mqtt_cfg.get("username", "")

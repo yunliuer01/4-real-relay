@@ -8,7 +8,7 @@ mqtt:
   username: "test"
   password: "123456"
   # 桥接器自身 client_id（建议唯一，避免多个实例互顶）
-  client_id: "virtual-bridge-01"
+  client_id: "lfx-bridge-01"
   # QoS，保持 1 可防止网络抖动时丢命令
   qos: 1
 
@@ -57,6 +57,18 @@ relays:
         inputs:
           channel: 1
           state: "{value}"
+      # JetLinks 物模型中 lock-lfx 还有 lock / unlock 两个 function（带 switch 入参），
+      # 平台"上锁开关"就是发到 lock function。同时映射两条，便于上层两种写法都能控。
+      lock:
+        function_id: "set_channel"
+        inputs:
+          channel: 1
+          state: true
+      unlock:
+        function_id: "set_channel"
+        inputs:
+          channel: 1
+          state: false
 
   - channel: 2
     product_id: "light-lfx-1"
@@ -117,6 +129,16 @@ relays:
     property_map:
       ch4_state: powerState
     command_map:
+      turnOn:
+        function_id: "set_channel"
+        inputs:
+          channel: 4
+          state: true
+      turnOff:
+        function_id: "set_channel"
+        inputs:
+          channel: 4
+          state: false
       powerState:
         function_id: "set_channel"
         inputs:
