@@ -53,10 +53,46 @@ WIFI_TIMEOUT_S = 45          # 上电连 WiFi 超时时间（单次 1001 connect
 LONG_PRESS_MS = 5000         # 长按 SW1 进入配网模式时间
 SW_LONG_PRESS_MS = 3000      # 长按 SW 时间（全关所有继电器）
 RETRY_S = 5                  # WiFi/MQTT 断线重连周期
-MQTT_KEEPALIVE = 60          # MQTT 保活
-MQTT_PING_S = 30             # 主动 PING 周期（须小于 keepalive）
+MQTT_KEEPALIVE = 45          # MQTT 保活（v6.0.4: 60->45，broker 更快判出半死连接并触发 will）
+MQTT_PING_S = 15             # 主动 PING 周期（v6.0.4: 30->15，加速暴露已死的 TCP 写通道）
 REPORT_INTERVAL_S = 5        # 属性上报周期
 CHANNEL_COUNT = 4
+
+# -------------------- v6.0.4 MQTT 链路自愈 --------------------
+# 【2026-09-10 实板定根因】症状：板子看起来一切正常（WiFi 在、MQTT "已连接"、
+# 心跳 ACK 一直在回），但父设备属性流彻底停摆，且 http /api/relay 也全部超时。
+#
+# 根因 = umqtt.simple 的 qos=1 publish 会阻塞等 PUBACK，而 paho/umqtt 的
+# 回调是在 wait_msg() 内部被调用的：
+#   主循环 publish_property()  -> PUBLISH(mid=A) -> wait_msg() 等 PUBACK(A)
+#     └─ 此时 bridge 心跳下行到达 -> wait_msg() 派发回调 -> handle_command()
+#          └─ publish_heartbeat_ack() -> 嵌套 publish -> 嵌套 wait_msg()
+#               └─ 读到的正是 PUBACK(A) 并把它消费掉
+#   外层 publish 再循环 wait_msg() -> 永远等不到 PUBACK(A) -> 主循环永久卡死。
+# 之后每次心跳仍能被「嵌套 publish」正常 ACK，所以 bridge 侧「心跳正常但属性停滞」
+# ——两个 watchdog（publish 异常计数 / 心跳超时）都不会触发，因为既没抛异常、
+# 心跳也没断。
+#
+# 修复 = 出站一律 qos=0：publish 只写 socket、不读 PUBACK，嵌套调用天然安全，
+# 主循环永不死锁。遥测/事件丢失代价可接受（5s 一次，且 bridge 仍能发现停滞）。
+# 订阅侧保持 qos=1 不变（订阅不等 PUBACK，无此风险）。
+PUB_QOS = 0                          # v6.0.4：出站发布 QoS（0 = 不等待 PUBACK，防死锁）
+
+# bridge 端会定时下发 functionId=__hb__ 的空操作心跳，payload 里带 stall_s
+# （= bridge 眼中「父设备属性已停滞多少秒」）。板子自己无法察觉上行静默丢失，
+# 由接收端（bridge）把真相回传，超阈值即主动断开重连。于是：
+#   1) 心跳让 MQTT 收/发两个方向始终有真实往返，板子不易进入半死；
+#   2) 超过 HEARTBEAT_TIMEOUT_S 没收到心跳 -> 判定链路已死，主动断开重连；
+#   3) 连续 PUB_FAIL_LIMIT 次 publish 抛错 -> 同样主动断开重连；
+#   4) bridge 报告 stall_s >= STALL_RECONNECT_S -> 上行静默丢失，主动断开重连。
+HEARTBEAT_FUNCTION_ID = "__hb__"     # 与 bridge config.yaml 的 function_id 一致
+HEARTBEAT_TIMEOUT_S = 180            # 心跳超时（秒）；可在 config.json 用 hb_timeout_s 覆盖
+PUB_FAIL_LIMIT = 3                   # 连续 publish 失败次数上限 -> 强制重连
+STALL_RECONNECT_S = 60               # bridge 报告的属性停滞秒数阈值 -> 强制重连
+# 刚连上时的宽限期：bridge 侧的「属性停滞」在板子重连瞬间仍是旧值，若立刻照做
+# 会形成「连上-重连」抖动。必须同时满足「本连接已稳定 CONN_GRACE_S 秒」
+# 且「本连接已 ACK 过 2 次心跳」才认这条指令。
+CONN_GRACE_S = 30
 
 CONFIG_PATH = "config.json"
 # 软复位后直接进 portal 的一次性标志文件：
@@ -102,6 +138,9 @@ DEFAULT_CONFIG = {
     "modbus": DEFAULT_MODBUS_CONFIG,
 }
 
+# v6.0.4：可在 config.json 里覆盖、但不暴露在配网页表单上的高级参数
+PASSTHROUGH_KEYS = ("hb_timeout_s", "stall_reconnect_s")
+
 # -------------------- 全局对象 --------------------
 relays = []
 button = None              # SW1 Pin 对象（IO10，长按 5 秒进配网）
@@ -122,6 +161,18 @@ last_ping = 0
 last_report = 0
 mqtt_retry = 0
 wifi_retry = 0
+# v6.0.4 MQTT 链路自愈诊断
+last_hb_ms = 0               # 最近一次收到网关心跳(__hb__)的时间
+hb_acks = 0                  # 已回给 bridge 的心跳 ACK 数（累计）
+hb_acks_conn = 0             # 本连接内已 ACK 的心跳数（重连即清零，用于 stall 指令宽限）
+pub_fail_streak = 0          # 连续 publish 失败计数
+mqtt_connects = 0            # MQTT 成功建连次数
+conn_ms = 0                  # 本连接建立时刻（ticks_ms），用于 stall 指令宽限
+stall_cmds = 0               # 收到「bridge 报告属性停滞」指令的次数
+stall_reconnect_active_s = STALL_RECONNECT_S  # 实际生效的停滞阈值（config.json 可覆盖）
+force_reconnect = False      # 需要主动断开重连（主循环消费）
+report_requested = False     # HTTP 请求的一次性上报（主循环消费，替代跨线程 publish）
+hb_timeout_active_s = HEARTBEAT_TIMEOUT_S   # 实际生效的心跳超时（config.json 可覆盖）
 button_state = 1
 press_start = 0
 long_triggered = False
@@ -147,6 +198,13 @@ def load_config():
         cfg = {}
     out = dict(DEFAULT_CONFIG)
     out.update({k: cfg[k] for k in DEFAULT_CONFIG if k in cfg})
+    # v6.0.4：高级调参项透传——这些键不进 DEFAULT_CONFIG（避免出现在配网页
+    # 表单里给普通用户误改），但允许预置在 config.json 中覆盖默认值，
+    # 并在 /save 回写时保留。目前有 hb_timeout_s（网关心跳超时秒数）、
+    # stall_reconnect_s（bridge 报告停滞多少秒后主动重连）。
+    for _k in PASSTHROUGH_KEYS:
+        if _k in cfg:
+            out[_k] = cfg[_k]
     # Modbus 配置兼容：无 mode 字段时按 uart_id 判断旧 RTU，否则默认 tcp
     mb = out.get("modbus") or DEFAULT_MODBUS_CONFIG
     if isinstance(mb, dict) and not mb.get("mode"):
@@ -380,6 +438,8 @@ class TopicManager:
 # -------------------- MQTT --------------------
 def mqtt_connect(cfg):
     global client, topics, last_ping, last_report, mqtt_retry
+    global last_hb_ms, pub_fail_streak, mqtt_connects
+    global hb_acks_conn, conn_ms
     from umqtt.simple import MQTTClient
     topics = TopicManager(cfg["product_id"], cfg["device_id"], cfg.get("topic_mode", "direct"))
     print("MQTT topics base:", topics.base)
@@ -400,7 +460,7 @@ def mqtt_connect(cfg):
         c.set_callback(mqtt_message)
         c.set_last_will(topics.offline().encode("utf-8"),
                         json.dumps({"deviceId": cfg["device_id"]}).encode("utf-8"),
-                        retain=True, qos=1)
+                        retain=True, qos=PUB_QOS)
         c.connect(clean_session=True)
         if cfg.get("topic_mode", "direct") == "sys":
             c.subscribe(topics.function_invoke_wildcard().encode("utf-8"), qos=1)
@@ -414,10 +474,16 @@ def mqtt_connect(cfg):
         last_ping = now_ms()
         last_report = 0  # 连上后立即触发一次上报
         mqtt_retry = 0
+        # v6.0.4：新连接给心跳一个宽限期，避免刚连上就被 watchdog 判死
+        last_hb_ms = now_ms()
+        hb_acks_conn = 0     # 本连接内的心跳 ACK 计数（stall 指令宽限用）
+        conn_ms = now_ms()   # 本连接建立时刻
+        pub_fail_streak = 0
+        mqtt_connects += 1
         print("MQTT connected:", cfg["mqtt_host"])
         c.publish(topics.online().encode("utf-8"),
                   json.dumps({"deviceId": cfg["device_id"]}).encode("utf-8"),
-                  retain=True, qos=1)
+                  retain=True, qos=PUB_QOS)
         publish_property(cfg)
         return True
     except Exception as e:
@@ -437,17 +503,88 @@ def mqtt_disconnect():
         client = None
 
 
+def _mark_pub_fail(where):
+    """v6.0.4：记一次发布失败，主循环据此判定是否需要强制重连。"""
+    global pub_fail_streak
+    pub_fail_streak += 1
+    print("[MQTT] pub fail streak=%d (%s)" % (pub_fail_streak, where))
+    return pub_fail_streak
+
+
+def _mark_pub_ok():
+    global pub_fail_streak
+    pub_fail_streak = 0
+
+
 def publish_property(cfg, force=False):
     if client is None:
         return
     try:
         payload = build_property_payload(cfg)
         client.publish(topics.property_post().encode("utf-8"),
-                       json.dumps(payload).encode("utf-8"), qos=1)
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
+        _mark_pub_ok()
         print("property posted")
     except Exception as e:
         print("property post error:", e)
+        _mark_pub_fail("property")
         raise
+
+
+def publish_heartbeat_ack(cfg, seq):
+    """v6.0.4：回应 bridge 下发的网关心跳。
+
+    走事件通道（direct 模式 = /{pid}/{did}/event/hb_ack），bridge 已订阅
+    .../event/+，收到即知板子「收 + 发」两个方向都活着——这正是 bridge
+    单看上行属性无法判断的（半死 socket 下 publish 静默丢失，不报错）。
+    """
+    global hb_acks, hb_acks_conn
+    if client is None:
+        return
+    try:
+        payload = {
+            "productId": cfg["product_id"],
+            "deviceId": cfg["device_id"],
+            "timestamp": int(time.time() * 1000),
+            "eventId": "hb_ack",
+            "data": {"seq": seq},
+        }
+        client.publish(topics.event("hb_ack").encode("utf-8"),
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
+        _mark_pub_ok()
+        hb_acks += 1
+        hb_acks_conn += 1
+        print("[MQTT] hb_ack #%d seq=%s" % (hb_acks, seq))
+    except Exception as e:
+        print("[MQTT] hb_ack publish error:", e)
+        _mark_pub_fail("hb_ack")
+
+
+def note_heartbeat(cfg, data):
+    """v6.0.4：收到网关心跳 -> 刷新存活时间戳、回 ACK，并解析 bridge 回传的停滞时长。
+
+    板子自己无法察觉「上行 publish 被静默丢弃」（既不抛异常，心跳 ACK 也照常往返
+    ——见文件头 2026-09-10 根因记录）。只有接收端 bridge 知道父设备属性断了多久，
+    所以由它在心跳 payload 里带 stall_s，这里超阈值即置 force_reconnect，
+    交主循环断开重连。这是「silent socket」类故障唯一的可探测点。
+    """
+    global last_hb_ms, force_reconnect, stall_cmds
+    last_hb_ms = now_ms()
+    publish_heartbeat_ack(cfg, data.get("messageId") or "")
+    try:
+        stall_s = int(data.get("stall_s", 0) or 0)
+    except (TypeError, ValueError):
+        stall_s = 0
+    if stall_s >= stall_reconnect_active_s and not force_reconnect:
+        # 宽限期：刚重连时 bridge 侧的停滞读数还是旧连接的，立刻照做会「连上→重连」抖动
+        conn_age_ms = time.ticks_diff(now_ms(), conn_ms)
+        if hb_acks_conn >= 2 and conn_age_ms >= CONN_GRACE_S * 1000:
+            stall_cmds += 1
+            force_reconnect = True
+            print("[MQTT] bridge reports upstream stalled %ds -> force reconnect" % stall_s)
+        else:
+            print("[MQTT] stall_s=%ds deferred (conn_age=%ds acks_conn=%d)"
+                  % (stall_s, conn_age_ms // 1000, hb_acks_conn))
 
 
 def publish_event(cfg, channel, state):
@@ -456,10 +593,12 @@ def publish_event(cfg, channel, state):
     try:
         payload = build_event_payload(cfg, channel, state)
         client.publish(topics.event("switch_change").encode("utf-8"),
-                       json.dumps(payload).encode("utf-8"), qos=1)
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
+        _mark_pub_ok()
         print("event switch_change ch%d=%s" % (channel, state))
     except Exception as e:
         print("event post error:", e)
+        _mark_pub_fail("event")
         raise
 
 
@@ -473,7 +612,7 @@ def publish_reply(cfg, message_id, success, output=True, function_id=None):
         else:
             reply_topic = topics.property_set_reply()
         client.publish(reply_topic.encode("utf-8"),
-                       json.dumps(payload).encode("utf-8"), qos=1)
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
     except Exception as e:
         print("reply post error:", e)
         raise
@@ -491,7 +630,7 @@ def publish_read_reply(cfg, message_id, props):
             "properties": props,
         }
         client.publish(topics.properties_read_reply().encode("utf-8"),
-                       json.dumps(payload).encode("utf-8"), qos=1)
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
     except Exception as e:
         print("read reply error:", e)
         raise
@@ -508,7 +647,7 @@ def publish_write_reply(cfg, message_id):
             "success": True,
         }
         client.publish(topics.properties_write_reply().encode("utf-8"),
-                       json.dumps(payload).encode("utf-8"), qos=1)
+                       json.dumps(payload).encode("utf-8"), qos=PUB_QOS)
     except Exception as e:
         print("write reply error:", e)
         raise
@@ -546,6 +685,9 @@ def mqtt_message(topic, payload):
             handle_write_property(data)
     except Exception as e:
         print("handle msg error:", e)
+        # v6.0.4：下行处理里的 OSError 基本等同于 socket 已坏，计入失败计数
+        if isinstance(e, OSError):
+            _mark_pub_fail("downlink-handler")
 
 
 # -------------------- 命令解析 --------------------
@@ -568,6 +710,10 @@ def handle_command(data, function_id=None):
     cfg = load_config()
     message_id = data.get("messageId") or data.get("id") or ""
     method = function_id or data.get("functionId") or data.get("method") or ""
+    # v6.0.4 网关心跳：不参与继电器逻辑，只刷新存活时间戳并立即回 ACK
+    if method == HEARTBEAT_FUNCTION_ID:
+        note_heartbeat(cfg, data)
+        return
     args = parse_inputs(data)
     print("handle command:", method, args)
 
@@ -764,6 +910,11 @@ def _http_json(conn, code, obj):
 def http_api_handler(cfg, conn):
     """HTTP 控制 API 路由（STA 模式下独立线程跑）
 
+    v6.0.4：本函数运行在 HTTP 线程，**绝不能直接调用任何 publish_*()**。
+    原因有两层：(1) 与主循环的 check_msg/ping 抢同一个 MQTT socket；
+    (2) umqtt publish 内部会 wait_msg 读 socket，两个线程同时读会让 PUBACK
+    被错误的线程吃掉。统一改为置标志，由主循环消费后 publish。
+
     路由：
     - GET /api/relay?ch=N&state=0/1  → 控制单路
     - GET /api/relay/all?state=0/1   → 全部控制
@@ -776,6 +927,7 @@ def http_api_handler(cfg, conn):
     - GET /api/sw?action=long        → SW 长按：全部关闭，cycle 重置
     - GET /api/modbus_values         → 当前 Modbus 采集实时值
     """
+    global report_requested
     try:
         head, _, rest = _read_request(conn)
     except Exception as e:
@@ -810,6 +962,18 @@ def http_api_handler(cfg, conn):
             "sw1_pin": cfg.get("sw1_pin"),
             "sw_pin": cfg.get("sw_pin"),
             "sw_cycle_idx": sw_cycle_idx,
+            # v6.0.4 MQTT 链路自愈诊断（判断板子是否处于半死 socket 状态）
+            "mqtt_connected": client is not None,
+            "mqtt_connects": mqtt_connects,
+            "hb_acks": hb_acks,
+            "hb_acks_conn": hb_acks_conn,
+            "hb_age_s": (int(time.ticks_diff(now_ms(), last_hb_ms) / 1000)
+                         if client is not None else None),
+            "pub_fail_streak": pub_fail_streak,
+            "pub_qos": PUB_QOS,
+            "stall_cmds": stall_cmds,
+            "force_reconnect": force_reconnect,
+            "hb_timeout_s": hb_timeout_active_s,
         }
         try:
             if wlan_sta and wlan_sta.isconnected():
@@ -857,10 +1021,8 @@ def http_api_handler(cfg, conn):
                            {"ok": True, "all": bool(state),
                             "changed": [i + 1 for i in changed]})
                 # 触发一次主动上报（即使 broker 下行不通也能把状态同步上去）
-                try:
-                    publish_property(cfg)
-                except Exception:
-                    pass
+                # v6.0.4：置标志交主循环 publish（HTTP 线程碰 MQTT socket 会死锁）
+                report_requested = True
                 return
             ch = int(q.get("ch", 0))
             state = q.get("state", None)
@@ -871,10 +1033,8 @@ def http_api_handler(cfg, conn):
             ok = set_relay(ch - 1, int(state))
             _http_json(conn, "200 OK",
                        {"ok": True, "ch": ch, "state": int(state), "changed": ok})
-            try:
-                publish_property(cfg)
-            except Exception:
-                pass
+            # v6.0.4：置标志交主循环 publish（HTTP 线程碰 MQTT socket 会死锁）
+            report_requested = True
             return
         except Exception as e:
             _http_json(conn, "500 Internal Server Error",
@@ -1418,6 +1578,8 @@ def stop_modbus():
 
 def run_normal(cfg):
     global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, sw_short_requested, mb_master, _http_stop
+    global pub_fail_streak, hb_timeout_active_s, force_reconnect, report_requested
+    global stall_reconnect_active_s
     if not connect_wifi(cfg):
         return False
 
@@ -1433,6 +1595,12 @@ def run_normal(cfg):
     last_ping = now_ms()
     mqtt_retry = 0
     wifi_retry = now_ms()
+    # v6.0.4 心跳超时阈值（可用板子 config.json 的 hb_timeout_s 覆盖）
+    hb_timeout_s = int(cfg.get("hb_timeout_s", HEARTBEAT_TIMEOUT_S))
+    hb_timeout_ms = max(1, hb_timeout_s) * 1000
+    hb_timeout_active_s = hb_timeout_s
+    # v6.0.4 bridge 报告的停滞阈值（可用 board config.json 的 stall_reconnect_s 覆盖）
+    stall_reconnect_active_s = max(10, int(cfg.get("stall_reconnect_s", STALL_RECONNECT_S)))
 
     if not mqtt_connect(cfg):
         pass  # 下面循环会继续重试
@@ -1460,6 +1628,14 @@ def run_normal(cfg):
                 print("[SW] SW short press publish OK")
             except Exception as e:
                 print("[SW] SW short press publish err:", e)
+        if report_requested:
+            # v6.0.4：HTTP /api/relay 触发的补报（HTTP 线程只置标志，不碰 socket）
+            report_requested = False
+            try:
+                publish_property(cfg)
+                print("[HTTP] relay change report published")
+            except Exception as e:
+                print("[HTTP] relay change report err:", e)
         if long_triggered or portal_requested:
             long_triggered = False
             portal_requested = False
@@ -1499,6 +1675,31 @@ def run_normal(cfg):
         else:
             try:
                 client.check_msg()
+                # v6.0.4 自愈 C：bridge 通过心跳回传「父设备属性已停滞 N 秒」
+                # -> 说明板子上行被静默丢弃（板子自己察觉不到），主动断开重连。
+                if force_reconnect:
+                    force_reconnect = False
+                    print("[MQTT] reconnect requested by gateway -> force reconnect")
+                    mqtt_disconnect()
+                    mqtt_retry = now
+                    continue
+                # v6.0.4 自愈 A：连续 publish 失败 -> 写通道已坏，主动断开重连
+                if pub_fail_streak >= PUB_FAIL_LIMIT:
+                    print("[MQTT] %d consecutive publish failures -> force reconnect"
+                          % pub_fail_streak)
+                    pub_fail_streak = 0
+                    mqtt_disconnect()
+                    mqtt_retry = now
+                    continue
+                # v6.0.4 自愈 B：网关心跳超时 -> 判定 MQTT 半死（TCP 看似
+                # ESTABLISHED、publish 静默丢失），主动断开重连。
+                # 没有这条时，板子会一直"假装在线"，直到人为干预。
+                if time.ticks_diff(now, last_hb_ms) >= hb_timeout_ms:
+                    print("[MQTT] gateway heartbeat timeout(%ds) -> force reconnect"
+                          % hb_timeout_s)
+                    mqtt_disconnect()
+                    mqtt_retry = now
+                    continue
                 if time.ticks_diff(now, last_ping) >= MQTT_PING_S * 1000:
                     client.ping()
                     last_ping = now

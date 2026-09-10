@@ -197,3 +197,23 @@ http_api:
   enabled: true
   host: "127.0.0.1"
   port: 18080
+
+# ---------------- v6.0.4 网关 MQTT 链路自愈 ----------------
+# 板子（ESP32-C3）长时间无对端交互后会进入「TCP 看着 ESTABLISHED、publish 静默
+# 丢失」的半死状态：bridge 收不到任何上行属性，但板子 HTTP API 仍然可用。
+# 这里定时向父设备下发一帧空操作心跳（functionId=__hb__），板子收到后立刻回
+# /event/hb_ack。这样：① 让板子的收/发路径始终有真实往返，不易进入半死；
+# ② bridge 能区分「板子真的没数据」和「链路断了」；③ 一旦发现上行停滞，
+# 自动把心跳加速到 stall_interval_seconds 把链路拍醒。
+# 板子侧配套：超过自身 hb_timeout_s（默认 180s，写在板子 config.json 里）没收到
+# 心跳就主动断开重连，无需人工干预。
+gateway_heartbeat:
+  enabled: true
+  interval_seconds: 45          # 常规心跳周期
+  stall_after_seconds: 40       # 超过该时长没收到父设备属性 -> 判定上行停滞
+  stall_interval_seconds: 10    # 停滞期间的心跳周期（加速"拍醒"）
+  function_id: "__hb__"         # 与固件 HEARTBEAT_FUNCTION_ID 保持一致
+  # 阈值配对（v6.0.4）：bridge 从 40s 起就把真实停滞秒数 stall_s 随心跳下发，
+  # 板子侧默认要等 stall_s >= 60s（板子 config.json 的 stall_reconnect_s 可覆盖）
+  # 才主动断开重连。故意留 20s 缓冲：bridge 只是观察者，真正动作由板子决定，
+  # 避免「刚连上就被判停滞 -> 立刻重连」的抖动。

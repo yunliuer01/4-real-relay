@@ -67,6 +67,15 @@ def load_config(path: str = "config.yaml") -> Dict[str, Any]:
     cfg.setdefault("sensors", [])
     cfg.setdefault("simulated", [])
     cfg.setdefault("http_api", {"enabled": True, "host": "0.0.0.0", "port": 8080})
+
+    # v6.0.4 网关链路自愈：定时向父设备下行 __hb__ 心跳，让板子的 MQTT
+    # 收发路径保持活跃；一旦父设备上行停滞，自动切到加速心跳把链路"拍醒"。
+    hb = cfg.setdefault("gateway_heartbeat", {})
+    hb.setdefault("enabled", True)
+    hb.setdefault("interval_seconds", 45)         # 常规心跳周期
+    hb.setdefault("stall_after_seconds", 40)      # 超过该时长没收到父设备属性 -> 判停滞
+    hb.setdefault("stall_interval_seconds", 10)   # 停滞时的加速心跳周期
+    hb.setdefault("function_id", "__hb__")
     return cfg
 
 
@@ -187,7 +196,16 @@ class VirtualDeviceBridge:
             "up_cmd": 0,        # 转发给父设备命令数
             "sim_post": 0,      # 模拟传感器上报数
             "errors": 0,
+            "hb_sent": 0,       # v6.0.4 下发网关心跳次数
+            "hb_ack": 0,        # v6.0.4 收到板子心跳应答次数
+            "stall_events": 0,  # v6.0.4 父设备上行停滞次数
         }
+
+        # v6.0.4 网关链路存活追踪（毫秒时间戳）
+        self.last_gateway_property_ms = time.time() * 1000
+        self.last_hb_ack_ms = 0
+        self._last_hb_sent_ms = 0
+        self._last_stall_log_ms = 0
 
         # 快速索引：父属性 key -> [(relay_index, child_key)]
         self.relay_prop_index: Dict[str, List[tuple]] = defaultdict(list)
@@ -202,6 +220,7 @@ class VirtualDeviceBridge:
         self._build_indexes()
         self._start_http_api()
         self._start_simulated_timers()
+        self._start_heartbeat()
 
     # ---------------- 索引构建 ----------------
     def _build_indexes(self):
@@ -334,6 +353,8 @@ class VirtualDeviceBridge:
     # ---------------- 上行：父设备属性拆分 ----------------
     def _handle_gateway_property(self, data: Dict[str, Any]):
         self.stats["up_property"] += 1
+        # v6.0.4：刷新父设备上行存活时间（心跳/停滞判定的依据）
+        self.last_gateway_property_ms = time.time() * 1000
         parent_props = data.get("properties", {})
         if not isinstance(parent_props, dict):
             return
@@ -408,6 +429,14 @@ class VirtualDeviceBridge:
         prefix = f"{gw_base}/{'thing/event/' if self.gw_topic.mode == 'sys' else 'event/'}"
         event_id = topic[len(prefix):] if topic.startswith(prefix) else ""
         if not event_id:
+            return
+
+        # v6.0.4：板子对网关心跳的应答——只用来判定"板子收+发双向都在线"，
+        # 不转发给任何子设备。
+        if event_id == "hb_ack":
+            self.stats["hb_ack"] += 1
+            self.last_hb_ack_ms = time.time() * 1000
+            log("DEBUG", f"gateway hb_ack #{self.stats['hb_ack']} data={data.get('data')}")
             return
 
         event_data = data.get("data", {})
@@ -531,6 +560,82 @@ class VirtualDeviceBridge:
             self.stats["sim_post"] += 1
             log("DEBUG", f"模拟上报 {device_id}: {props}")
 
+    # ---------------- v6.0.4 网关心跳（MQTT 链路自愈） ----------------
+    def _start_heartbeat(self):
+        hb = self.cfg.get("gateway_heartbeat", {}) or {}
+        if not hb.get("enabled", True):
+            log("INFO", "网关心跳已禁用 (gateway_heartbeat.enabled=false)")
+            return
+        t = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                             name="gw-heartbeat")
+        t.start()
+        log("INFO", "网关心跳已启动: 常规 %ss / 停滞 %ss（超 %ss 未收到父设备属性即判停滞，"
+                    "停滞值随心跳下发板子触发其自愈重连）"
+            % (hb.get("interval_seconds", 45),
+               hb.get("stall_interval_seconds", 10),
+               hb.get("stall_after_seconds", 40)))
+
+    def _send_gateway_heartbeat(self):
+        """向父设备下发一帧空操作心跳，强制板子走一遍"收 -> 回"的完整 MQTT 路径。
+
+        板子固件识别 functionId=__hb__ 后立即回 /event/hb_ack，因此 hb_ack 的
+        到达说明板子的收/发两个方向都真的活着——这正是 bridge 单靠上行属性
+        无法判断的事情。
+
+        payload 额外带 stall_s = 本进程眼中「父设备属性已停滞多少秒」。
+        板子无法察觉自己的上行被静默丢弃（publish 不抛异常、心跳也照常往返），
+        只有接收端 bridge 知道真相，所以由这里把读数回传；板子据此超阈值主动
+        断开重连。这是 2026-09-10 实板排查出的「bridge 报停滞 -> 板子自愈」闭环。
+        """
+        hb = self.cfg.get("gateway_heartbeat", {}) or {}
+        self.stats["hb_sent"] += 1
+        stall_s = int(max(0.0, (time.time() * 1000 - self.last_gateway_property_ms) / 1000.0))
+        payload = {
+            "messageId": "hb-%d" % self.stats["hb_sent"],
+            "functionId": hb.get("function_id", "__hb__"),
+            "inputs": [],
+            "stall_s": min(stall_s, 86400),
+        }
+        self._publish(
+            self.gw_topic.service_cmd(self.gateway["product_id"], self.gateway["device_id"]),
+            payload,
+        )
+        self._last_hb_sent_ms = time.time() * 1000
+
+    def _heartbeat_loop(self):
+        hb = self.cfg.get("gateway_heartbeat", {}) or {}
+        interval_ms = max(1, int(hb.get("interval_seconds", 45))) * 1000
+        stall_after_ms = max(1, int(hb.get("stall_after_seconds", 40))) * 1000
+        stall_interval_ms = max(1, int(hb.get("stall_interval_seconds", 10))) * 1000
+        # 上电初期不打扰：等板子的首包属性上行到位再开始打心跳
+        time.sleep(3)
+        while True:
+            try:
+                if not self.connected:
+                    time.sleep(1)
+                    continue
+                now = time.time() * 1000
+                age = now - self.last_gateway_property_ms
+                stalled = age >= stall_after_ms
+                interval = stall_interval_ms if stalled else interval_ms
+                if now - self._last_hb_sent_ms >= interval:
+                    if stalled and now - self._last_stall_log_ms >= 30000:
+                        self._last_stall_log_ms = now
+                        self.stats["stall_events"] += 1
+                        # 板子心跳还在回、属性却停滞 => 上行静默丢失。stall_s 已随
+                        # 心跳回传给板子，由它自主断开重连（板子侧无法自查这类故障）。
+                        ack_age = (now - self.last_hb_ack_ms) if self.last_hb_ack_ms else None
+                        log("WARN", "父设备上行停滞 %.0fs（板子心跳 %s）-> 已随心跳下发 stall_s，"
+                                    "等待板子自愈"
+                            % (age / 1000.0,
+                               ("%.0fs 前" % (ack_age / 1000.0)) if ack_age is not None
+                               else "未收到过"))
+                    self._send_gateway_heartbeat()
+                time.sleep(1)
+            except Exception as e:
+                log("ERROR", f"网关心跳线程异常: {e}")
+                time.sleep(3)
+
     # ---------------- 发布封装 ----------------
     def _publish(self, topic: str, payload: Dict[str, Any]):
         if not self.client or not self.connected:
@@ -556,11 +661,22 @@ class VirtualDeviceBridge:
 
         @app.route("/health", methods=["GET"])
         def health():
+            now_ms = time.time() * 1000
+            hb = self.cfg.get("gateway_heartbeat", {}) or {}
             return jsonify({
                 "status": "ok" if self.connected else "disconnected",
                 "connected": self.connected,
                 "gateway": self.gateway,
                 "stats": self.stats,
+                # v6.0.4 链路存活诊断
+                "gateway_link": {
+                    "last_property_age_s": round((now_ms - self.last_gateway_property_ms) / 1000.0, 1),
+                    "last_hb_ack_age_s": (round((now_ms - self.last_hb_ack_ms) / 1000.0, 1)
+                                          if self.last_hb_ack_ms else None),
+                    "stalled": (now_ms - self.last_gateway_property_ms)
+                               >= max(1, int(hb.get("stall_after_seconds", 40))) * 1000,
+                    "heartbeat_interval_s": hb.get("interval_seconds", 45),
+                },
             })
 
         @app.route("/config", methods=["GET"])
@@ -583,11 +699,16 @@ class VirtualDeviceBridge:
     def run(self):
         self.connect()
         log("INFO", "Virtual Device Bridge started. Press Ctrl+C to stop.")
+        last_warn_ms = 0
         try:
             while True:
                 time.sleep(1)
                 if not self.connected:
-                    log("WARN", "等待 MQTT 重连...")
+                    # 每 30s 最多打一条，避免断线期间刷屏把日志冲爆
+                    now_ms = time.time() * 1000
+                    if now_ms - last_warn_ms >= 30000:
+                        last_warn_ms = now_ms
+                        log("WARN", "等待 MQTT 重连...（paho 自动重连中）")
         except KeyboardInterrupt:
             log("INFO", "正在停止...")
             if self.client:
@@ -597,6 +718,7 @@ class VirtualDeviceBridge:
 
 def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    log("INFO", f"bridge 启动 pid={os.getpid()} cwd={os.getcwd()} config={config_path}")
     if not os.path.exists(config_path):
         sys.exit(f"配置文件不存在: {config_path}")
     cfg = load_config(config_path)
@@ -605,4 +727,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # v6.0.4：进程级兜底——异常退出时把堆栈写进日志（2026-09-10 曾出现
+    # bridge 夜间静默死亡、日志无任何线索），并返回非 0 退出码，
+    # 便于 _run_supervised.cmd 之类的守护脚本自动拉起。
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        import traceback
+        log("FATAL", "bridge 异常退出，堆栈如下：")
+        traceback.print_exc()
+        sys.exit(1)

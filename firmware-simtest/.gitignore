@@ -2,6 +2,7 @@
 flash/
 flash_modbus/
 flash_modbus_tcp/
+flash_v604/
 __pycache__/
 _run_tcp_result.txt
 # 一次性调试脚本（硬编码本机路径，不入库）

@@ -12,6 +12,22 @@
 - 调用 sim_up()：恢复。
 - 固件每次 mqtt_connect 都会 new 一个 MQTTClient，这里按 client_id 维护注册表，
   新连接建立前先断开同 client_id 的旧连接，避免 broker 侧连接顶号/冲突。
+
+qos=1 发布死锁仿真（v6.0.4 关键回归保护）：
+  环回模式下 publish(qos=1) 不再“同步返回”，而是**忠实复刻 MicroPython
+  umqtt.simple 的分包语义**——真机源码：
+      publish(): if qos == 1: while 1: op = self.wait_msg(); if op == 0x40: ...
+      wait_msg(): self.sock.setblocking(True); ... self.cb(topic, msg)
+  即「publish 自旋等 PUBACK」与「回调在 wait_msg 内被派发」共用同一个读循环。
+  于是：主循环 publish(qos=1) 等 PUBACK 时若来了下行 -> wait_msg 派发回调 ->
+  回调里再 publish(qos=1) -> 嵌套的 wait_msg 把**外层那颗 PUBACK 读走并丢弃**
+  （pid 不匹配 -> 继续循环）-> 外层回到阻塞读，永久卡死、不抛异常。
+  真机表现 = 心跳照常、/api/info 全绿、属性流彻底停摆（2026-09-10 实板事故）。
+
+  环回下无法真的“永久阻塞”（会让测试挂死），故超时后抛 MQTTPubackDeadlock，
+  并把事件记入 sim_deadlock_events()。正确写法是出站一律 qos=0。
+  注意：真实 broker 模式走 paho（异步、线程安全），不复现该缺陷；
+  该仿真只在环回模式生效。
 """
 from __future__ import annotations
 
@@ -22,13 +38,59 @@ import paho.mqtt.client as mqtt
 
 _CB_API = getattr(mqtt, "CallbackAPIVersion", None)
 
+# 环回模式 qos=1 publish 自旋等待 PUBACK 的上限；超时即认定死锁（真机此处永久阻塞）
+PUBACK_WAIT_TIMEOUT_S = 2.0
+
 # 当前是否模拟“断网”
 _blocked = False
 # 环回模式：broker 不可达时也在本地“连接成功”，上行消息记录到 _rec_msgs，
 # 下行消息由 sim_downlink 注入。用于无真实 broker 的环境跑全链路断言。
 _loopback = False
 _rec_msgs = []          # (topic_str, payload_str, retain, qos)，固件→平台 上行
+# 上行的附带元信息（与 _rec_msgs 同序）：{"topic","qos","retain","tid"}
+# tid = 调用线程 ident，用于断言「HTTP 线程绝不直接 publish」（v6.0.4 修复项 2）
+_rec_meta = []
+_deadlock_events = []   # 环回模式下 publish(qos=1) 死锁事件（v6.0.4 回归保护）
 _rec_lock = threading.Lock()
+
+
+class MQTTPubackDeadlock(AssertionError):
+    """环回模式复刻真机 umqtt.simple 缺陷：publish(qos=1) 的 PUBACK 被嵌套 wait_msg 吃掉。"""
+
+
+def sim_recv_meta(from_index=0):
+    """取上行元信息：[{"topic","qos","retain","tid"}, ...]"""
+    with _rec_lock:
+        return [dict(m) for m in _rec_meta[from_index:]]
+
+
+def sim_outbound_qos():
+    """取本次运行所有出站 publish 的 qos 列表（v6.0.4：应全为 0）。"""
+    with _rec_lock:
+        return [q for (_t_, _p, _r, q) in _rec_msgs]
+
+
+def sim_deadlock_count():
+    with _rec_lock:
+        return len(_deadlock_events)
+
+
+def sim_deadlock_events():
+    with _rec_lock:
+        return list(_deadlock_events)
+
+
+def sim_reset_deadlock():
+    with _rec_lock:
+        del _deadlock_events[:]
+
+
+def sim_reset_records():
+    """清空上行记录与死锁事件（测试自检阶段用，避免污染后续断言）。"""
+    with _rec_lock:
+        del _rec_msgs[:]
+        del _rec_meta[:]
+        del _deadlock_events[:]
 # 注意：connect() 会在持有锁的情况下调用 old.disconnect()，而 disconnect() 也要取锁，
 # 因此必须用可重入的 RLock，否则同 client_id 重建连接时会死锁。
 _lock = threading.RLock()
@@ -120,6 +182,8 @@ class MQTTClient:
         self._loop_ok = False       # 环回模式：无需真实 paho 连接
         self._loop_subs = None      # 环回模式：订阅的 topic 集合(str)
         self._dl_q = []             # 环回模式：平台下行消息队列
+        self._mid = 0               # 环回模式：出站 packet id 计数（对齐 umqtt self.pid）
+        self._pubacks = []          # 环回模式：broker 已回、等待被读走的 PUBACK mid 队列
         with _lock:
             _instances.append(self)
 
@@ -152,6 +216,7 @@ class MQTTClient:
             self._loop_ok = True
             self._loop_subs = set()
             self._dl_q = []
+            self._pubacks = []
             with _lock:
                 _conn_count += 1
             return
@@ -256,13 +321,56 @@ class MQTTClient:
             raise TypeError("umqtt topic must be bytes, got str")
         if isinstance(msg, str):
             raise TypeError("umqtt msg must be bytes, got str")
+        tid = threading.get_ident()
+        with _rec_lock:
+            _rec_msgs.append((self._to_str(topic), self._to_str(msg), bool(retain), qos))
+            _rec_meta.append({"topic": self._to_str(topic), "qos": qos,
+                              "retain": bool(retain), "tid": tid})
         if self._loop_ok:
-            with _rec_lock:
-                _rec_msgs.append((self._to_str(topic), self._to_str(msg), bool(retain), qos))
+            if qos:
+                self._spin_puback(qos)
             return
         if self._paho is None:
             raise OSError("not connected")
+        # 真实 broker 走 paho：异步、线程安全，天然没有 PUBACK 争用问题
         self._paho.publish(self._to_str(topic), msg, qos=qos, retain=retain)
+
+    def _spin_puback(self, qos, topic=""):
+        """环回模式复刻 umqtt.simple 的 publish(qos=1) 自旋：
+
+            while 1:
+                op = self.wait_msg()      # 读一个包；若为下行 PUBLISH 则派发回调
+                if op == 0x40: ...        # 只有 pid 匹配才 return，不匹配直接丢弃
+
+        因此回调内再 publish(qos=1) 时，嵌套的 wait_msg 会把外层的 PUBACK 读走丢弃，
+        外层永远等不到 —— 真机表现为无异常的永久阻塞。
+        """
+        self._mid += 1
+        mid = self._mid
+        self._pubacks.append(mid)        # 环回无网络延迟：broker 立即回 PUBACK
+        deadline = _t.monotonic() + PUBACK_WAIT_TIMEOUT_S
+        while True:
+            # 1) 有下行就派发（对齐 wait_msg(): 读到 PUBLISH 即进回调），可能递归 publish
+            if self._dl_q:
+                t_b, p_b = self._dl_q.pop(0)
+                if self.cb:
+                    self.cb(t_b, p_b)
+                continue
+            # 2) 读走一颗 PUBACK；非本 mid 的会被直接丢弃（真机 bug 核心）
+            if self._pubacks:
+                got = self._pubacks.pop(0)
+                if got == mid:
+                    return
+                continue
+            # 3) 真机在此处 sock.read(1) 永久阻塞。仿真里超时即报错，避免测试挂死。
+            if _t.monotonic() >= deadline:
+                ev = ("publish(qos=%d) 等不到自己的 PUBACK(mid=%s)：已被嵌套的 "
+                      "wait_msg 消费掉 -> 真机永久阻塞。出站 publish 必须用 qos=0。"
+                      % (qos, mid))
+                with _rec_lock:
+                    _deadlock_events.append(ev)
+                raise MQTTPubackDeadlock(ev)
+            _t.sleep(0.005)
 
     def check_msg(self):
         """paho 后台线程已投递消息；环回模式由本方法从 _dl_q 拉取并回调。"""
@@ -303,6 +411,7 @@ class MQTTClient:
             self._loop_ok = False
             self._loop_subs = None
             self._dl_q = []
+            self._pubacks = []
             with _lock:
                 if _by_cid.get(self._to_str(self.client_id)) is self:
                     _by_cid.pop(self._to_str(self.client_id), None)
