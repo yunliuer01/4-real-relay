@@ -157,6 +157,12 @@ def inject_stubs(web_port=18081):
     n.sim_set_sta_connected(False)
     n.sim_set_sta_mac(bytes([0x24, 0x0a, 0xc4, 0x00, 0x12, 0x34]))
     sk.PORT_MAP[80] = int(web_port)
+    # loopback 模式下固件的 mqtt_host/mqtt_port 是占位地址（真实 MQTT 走进程内
+    # 总线：run_sim_modbus 用 (127.0.0.1, 1)，独立测试脚本用 (127.0.0.1, 1883)）。
+    # v6.0.5 固件在建连前会做带超时的 TCP 预检，必须让这些占位端点「语义上可达」，
+    # 否则固件连不进总线（表现为 A1/A2 全超时）。
+    for _ep in (("127.0.0.1", 1), ("127.0.0.1", 1883)):
+        sk.sim_add_virtual_endpoint(*_ep)
 
     sys.modules["machine"] = m
     sys.modules["network"] = n

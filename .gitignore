@@ -26,6 +26,20 @@ data/device_backup.json
 /_*.py
 /_*.txt
 /_*.bin
+/_*.png
+/_*.cmd
+/_*.err
+/_*.out
+# .mpy 工具链实验工作区（临时）
+/_mpytest/
+# 误命名的诊断脚本（文件名里的 "D:\8-relay" 未转义，会话遗留）
+/*_diag_*.py
+/_jl_index.*
+/_tmp_mqtt_probe.*
+/_launch_bridge.cmd
+/_restart_bridge.cmd
+/_start_capture.cmd
+/virtual-device-bridge/_*.cmd
 # 会话辅助（含连接信息，勿入库）
 /cfg*.py
 /cfg.json
@@ -33,6 +47,8 @@ data/device_backup.json
 /update_cfg.py
 /_press1.lognecho
 firmware-simtest/flash_modbus/_*.py
+# v6.0.5 打包上传暂存（含板级 config.json 连接信息，勿入库）
+firmware-simtest/flash_v605/
 
 # 板级备份（含 config.json 连接信息，勿入库）
 /_board_backup*/

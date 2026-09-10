@@ -16,6 +16,26 @@
 - LED 指示灯：IO2
 - 保留 Modbus RTU (UART1)：默认 TX=IO20, RX=IO21, RS485 方向控制=IO8（mode=rtu 时启用）
 - Modbus TCP：通过 STA WiFi 走 socket，无需额外硬件接线
+
+版本要点（近期）：
+- v6.0.5：① HTTP 控制 API 改为主循环非阻塞轮询（修「/api/relay 并发>=4 整机静默
+  冻结」）；② 自愈 D：WiFi 假死（isconnected() 真但数据面死）主动重新关联；
+  ③ MQTT 建连前加带超时的 TCP 预检，避免阻塞 connect() 饿死主循环；
+  ④ 自愈 D 冷启动冷却修正（wifi_reassoc_ms 初值 None）；⑤ 自愈 E：网络彻底
+  不可用则 machine.reset() 回退到 boot 空堆预连；⑥ HTTP 有连接在途时轮询间隔
+  压到 20ms（原固定 0.1s 把吞吐压到 ~5 连接/秒）。
+  上述故障的完整根因/证据/排查手法见 .workbuddy/memory/ROOTCAUSES.md。
+- v6.0.4：出站 publish 全部 QoS0 + 半死连接自愈 A/B/C（publish 连续失败 /
+  网关心跳超时 / bridge 报告停滞 -> 主动断开重连）。
+- v6.0.1：boot.py + wifi_boot.py 空堆预连 WiFi，规避 esp_sha DMA 内存挤占。
+
+注意（v6.0.5 起关于本文件的体积约定已解除）：**本文件不再被板子直接编译**。
+板上跑的是引导壳 `main_entry.py`（落为 /main.py，仅 1KB），本文件由
+`build_mpy.py` 用 mpy-cross 预编译成 `app_main.mpy`（~28KB）再上传，
+板上只 `import`，不驻留源码串与解析树 —— 之前「源码直编峰值 2x 撑爆堆」
+（2026-09-10 MemoryError）由此彻底解决，体积余量从 ~80KB 抬到 ~290KB。
+改完本文件**必须重跑 `build_mpy.py` 并重新部署**，否则板上跑的还是旧字节码
+（`deploy.py` 有产物新鲜度守卫 + 仿真台 P8 会拦）。
 """
 import json
 import os
@@ -33,7 +53,8 @@ HAS_MODBUS = False
 ModbusTCPMaster = None
 ModbusMaster = None
 
-# MicroPython 的 _thread 模块（HTTP 控制 API 用；缺时自动跳过）
+# MicroPython 的 _thread 模块（v6.0.5 起 HTTP 已回主循环，现仅 Modbus worker
+# 线程用；缺时自动跳过。stack_size 仍在 start_control_http 里统一设定）
 try:
     import _thread
 except ImportError:
@@ -59,32 +80,16 @@ REPORT_INTERVAL_S = 5        # 属性上报周期
 CHANNEL_COUNT = 4
 
 # -------------------- v6.0.4 MQTT 链路自愈 --------------------
-# 【2026-09-10 实板定根因】症状：板子看起来一切正常（WiFi 在、MQTT "已连接"、
-# 心跳 ACK 一直在回），但父设备属性流彻底停摆，且 http /api/relay 也全部超时。
-#
-# 根因 = umqtt.simple 的 qos=1 publish 会阻塞等 PUBACK，而 paho/umqtt 的
-# 回调是在 wait_msg() 内部被调用的：
-#   主循环 publish_property()  -> PUBLISH(mid=A) -> wait_msg() 等 PUBACK(A)
-#     └─ 此时 bridge 心跳下行到达 -> wait_msg() 派发回调 -> handle_command()
-#          └─ publish_heartbeat_ack() -> 嵌套 publish -> 嵌套 wait_msg()
-#               └─ 读到的正是 PUBACK(A) 并把它消费掉
-#   外层 publish 再循环 wait_msg() -> 永远等不到 PUBACK(A) -> 主循环永久卡死。
-# 之后每次心跳仍能被「嵌套 publish」正常 ACK，所以 bridge 侧「心跳正常但属性停滞」
-# ——两个 watchdog（publish 异常计数 / 心跳超时）都不会触发，因为既没抛异常、
-# 心跳也没断。
-#
-# 修复 = 出站一律 qos=0：publish 只写 socket、不读 PUBACK，嵌套调用天然安全，
-# 主循环永不死锁。遥测/事件丢失代价可接受（5s 一次，且 bridge 仍能发现停滞）。
-# 订阅侧保持 qos=1 不变（订阅不等 PUBACK，无此风险）。
+# 根因：umqtt qos=1 publish 阻塞等 PUBACK，而回调在 wait_msg() 内派发 —— 心跳
+# 下行触发的嵌套 publish 会把外层等的 PUBACK 吃掉，外层永久卡死（心跳仍正常、
+# 属性停滞、/api/relay 全超时）。修复：出站一律 qos=0（不读 PUBACK，嵌套安全）；
+# 订阅侧保持 qos=1。完整推演见 ROOTCAUSES.md 第 1 条。
 PUB_QOS = 0                          # v6.0.4：出站发布 QoS（0 = 不等待 PUBACK，防死锁）
 
-# bridge 端会定时下发 functionId=__hb__ 的空操作心跳，payload 里带 stall_s
-# （= bridge 眼中「父设备属性已停滞多少秒」）。板子自己无法察觉上行静默丢失，
-# 由接收端（bridge）把真相回传，超阈值即主动断开重连。于是：
-#   1) 心跳让 MQTT 收/发两个方向始终有真实往返，板子不易进入半死；
-#   2) 超过 HEARTBEAT_TIMEOUT_S 没收到心跳 -> 判定链路已死，主动断开重连；
-#   3) 连续 PUB_FAIL_LIMIT 次 publish 抛错 -> 同样主动断开重连；
-#   4) bridge 报告 stall_s >= STALL_RECONNECT_S -> 上行静默丢失，主动断开重连。
+# bridge 定时下发 functionId=__hb__ 心跳，payload 带 stall_s（bridge 眼中属性停滞
+# 秒数）——接收端把真相回传，板子据此自愈：超 HEARTBEAT_TIMEOUT_S 没收到心跳、
+# 连续 PUB_FAIL_LIMIT 次 publish 抛错、bridge 报 stall_s >= STALL_RECONNECT_S
+# 三种情况都主动断开重连。
 HEARTBEAT_FUNCTION_ID = "__hb__"     # 与 bridge config.yaml 的 function_id 一致
 HEARTBEAT_TIMEOUT_S = 180            # 心跳超时（秒）；可在 config.json 用 hb_timeout_s 覆盖
 PUB_FAIL_LIMIT = 3                   # 连续 publish 失败次数上限 -> 强制重连
@@ -93,6 +98,27 @@ STALL_RECONNECT_S = 60               # bridge 报告的属性停滞秒数阈值 
 # 会形成「连上-重连」抖动。必须同时满足「本连接已稳定 CONN_GRACE_S 秒」
 # 且「本连接已 ACK 过 2 次心跳」才认这条指令。
 CONN_GRACE_S = 30
+
+# ---- v6.0.5 自愈 D：WiFi 数据面假死（isconnected() 真但收发包全丢）----
+# 症状：isconnected()=True / status=1010 / 有合法 IP，但 MQTT 建连
+# [Errno 113] ECONNABORTED，PC 侧 ping 大量丢包。主循环原「WiFi 断线重连」
+# 只在 isconnected()=False 时触发 -> 假死下恒 True，会永远卡在 MQTT 重试。
+# 对策：连续建连失败 >= 阈值且仍自称已连接 -> disconnect()+connect() 重组。
+MQTT_FAIL_REASSOC = 3                # 连续 MQTT 建连失败达到该值 -> 触发重新关联
+WIFI_REASSOC_COOLDOWN_MS = 90000     # 两次重新关联之间的最小间隔
+
+# ---- v6.0.5 自愈 E：网络彻底不可用 -> 硬复位，回退到 boot 空堆预连 ----
+# 实板出现过「自愈 D 捅完后停在 IDLE 再也不连」的死局，只能人工断电。捅不动就
+# 换更粗的锤子：machine.reset() -> 回到 boot.py 空堆预连（最可靠的起点）。
+# 三重与门防复位风暴：曾连上过 + 不可用超 NET_RESET_AFTER_MS + 本轮重组超
+# NET_RESET_MIN_REASSOCS 次。复位后若仍连不上则本分支不再成立，交回 portal 守卫。
+NET_RESET_AFTER_MS = 180000          # MQTT 连续不可用达到该时长 -> 考虑硬复位
+NET_RESET_MIN_REASSOCS = 2           # 且本轮不可用期间至少重新关联过这么多次
+
+# ---- v6.0.5 建连超时预检：别让阻塞 connect() 饿死主循环 ----
+# 链路差时阻塞 connect() 要等 lwIP SYN 重传耗尽（单次可达 ~55s，实测 210s 只
+# 跑完 3 次建连），期间主循环停摆。故建连前先用带 settimeout 的 socket 预检。
+MQTT_CONNECT_TIMEOUT_S = 3           # TCP 预检超时（秒）
 
 CONFIG_PATH = "config.json"
 # 软复位后直接进 portal 的一次性标志文件：
@@ -155,8 +181,15 @@ _wifi_failed_this_boot = False  # 本进程 WiFi 是否失败过（守卫据此�
 client = None
 topics = None
 mb_master = None
-_http_srv = None             # HTTP API 监听 socket 全局引用
-_http_stop = False           # HTTP API 线程退出标志（portal 切换前置 True 等线程退出）
+# v6.0.5：HTTP 控制 API 改为「主循环非阻塞轮询」，不再开独立线程
+_http_srv = None             # HTTP API 监听 socket（主线程持有）
+_http_stop = False           # 停止标志（portal 切换前关闭监听 socket）
+_http_conn = None            # 当前正在读取的客户端连接（单连接状态机）
+_http_buf = b""              # 当前连接已读入的请求字节
+_http_deadline_ms = 0        # 当前连接的读超时截止（ticks_ms）
+_http_polls = 0              # 主循环 HTTP 轮询次数（诊断）
+_http_reqs = 0               # 已完成（读全并处理）的 HTTP 请求数（诊断）
+_http_aborts = 0             # 半开/超时/超长被丢弃的连接数（诊断）
 last_ping = 0
 last_report = 0
 mqtt_retry = 0
@@ -168,6 +201,14 @@ hb_acks_conn = 0             # 本连接内已 ACK 的心跳数（重连即清�
 pub_fail_streak = 0          # 连续 publish 失败计数
 mqtt_connects = 0            # MQTT 成功建连次数
 conn_ms = 0                  # 本连接建立时刻（ticks_ms），用于 stall 指令宽限
+# v6.0.5 自愈 D：WiFi 数据面假死诊断
+mqtt_fail_streak = 0         # 连续 MQTT 建连失败次数（成功即清零）
+wifi_reassocs = 0            # 已主动触发的「重新关联」次数（诊断）
+wifi_reassoc_ms = None       # 上次重新关联时刻（ticks_ms）；None=从未触发，冷却门据此放行
+# v6.0.5 自愈 E：网络彻底不可用 -> 硬复位
+net_dead_since = 0           # 本轮「MQTT 不可用」起点（ticks_ms）；0=当前链路正常
+net_dead_base_reassocs = 0   # 进入本轮不可用时刻的 wifi_reassocs 基线（算"本轮捅了几次"）
+net_resets = 0               # 已因网络不可用发起的硬复位次数（诊断）
 stall_cmds = 0               # 收到「bridge 报告属性停滞」指令的次数
 stall_reconnect_active_s = STALL_RECONNECT_S  # 实际生效的停滞阈值（config.json 可覆盖）
 force_reconnect = False      # 需要主动断开重连（主循环消费）
@@ -198,10 +239,8 @@ def load_config():
         cfg = {}
     out = dict(DEFAULT_CONFIG)
     out.update({k: cfg[k] for k in DEFAULT_CONFIG if k in cfg})
-    # v6.0.4：高级调参项透传——这些键不进 DEFAULT_CONFIG（避免出现在配网页
-    # 表单里给普通用户误改），但允许预置在 config.json 中覆盖默认值，
-    # 并在 /save 回写时保留。目前有 hb_timeout_s（网关心跳超时秒数）、
-    # stall_reconnect_s（bridge 报告停滞多少秒后主动重连）。
+    # v6.0.4：高级调参项透传——不进 DEFAULT_CONFIG（不在配网页表单里给普通用户
+    # 误改），但允许预置在 config.json 覆盖默认值，/save 回写时保留。
     for _k in PASSTHROUGH_KEYS:
         if _k in cfg:
             out[_k] = cfg[_k]
@@ -436,10 +475,32 @@ class TopicManager:
 
 
 # -------------------- MQTT --------------------
+def _tcp_preflight(host, port, timeout_s):
+    """带超时的 TCP 可达性预检。
+
+    socket settimeout 后 connect() 走非阻塞+poll，到点抛 ETIMEDOUT，故能把
+    「等 SYN 重传耗尽」的最坏 ~55s 压到 timeout_s。返回 True = TCP 可达。
+    """
+    s = None
+    try:
+        s = socket.socket()
+        s.settimeout(timeout_s)
+        s.connect(socket.getaddrinfo(host, port)[0][-1])
+        return True
+    except Exception:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def mqtt_connect(cfg):
     global client, topics, last_ping, last_report, mqtt_retry
     global last_hb_ms, pub_fail_streak, mqtt_connects
-    global hb_acks_conn, conn_ms
+    global hb_acks_conn, conn_ms, mqtt_fail_streak
     from umqtt.simple import MQTTClient
     topics = TopicManager(cfg["product_id"], cfg["device_id"], cfg.get("topic_mode", "direct"))
     print("MQTT topics base:", topics.base)
@@ -448,6 +509,11 @@ def mqtt_connect(cfg):
         # umqtt.simple import + socket 建立前回收碎片（C3 堆紧张，实测
         # 不 collect 时偶发 ECONNABORTED/ENOMEM 建连失败）
         gc.collect()
+        # v6.0.5：先做带超时的 TCP 预检，绝不让阻塞 connect 把主循环拖住几十秒。
+        if not _tcp_preflight(cfg["mqtt_host"], int(cfg["mqtt_port"]),
+                              MQTT_CONNECT_TIMEOUT_S):
+            raise OSError(110, "preflight: tcp %s:%s unreachable in %ss" % (
+                cfg["mqtt_host"], cfg["mqtt_port"], MQTT_CONNECT_TIMEOUT_S))
         # umqtt.simple 要求 bytes：topic/payload/client_id 均显式编码
         c = MQTTClient(
             cfg["device_id"].encode("utf-8"),
@@ -479,6 +545,7 @@ def mqtt_connect(cfg):
         hb_acks_conn = 0     # 本连接内的心跳 ACK 计数（stall 指令宽限用）
         conn_ms = now_ms()   # 本连接建立时刻
         pub_fail_streak = 0
+        mqtt_fail_streak = 0     # v6.0.5 自愈 D：建连成功即清零
         mqtt_connects += 1
         print("MQTT connected:", cfg["mqtt_host"])
         c.publish(topics.online().encode("utf-8"),
@@ -488,6 +555,7 @@ def mqtt_connect(cfg):
         return True
     except Exception as e:
         print("MQTT connect failed:", e)
+        mqtt_fail_streak += 1        # v6.0.5 自愈 D：累计连续建连失败
         client = None
         mqtt_retry = time.ticks_add(now_ms(), RETRY_S * 1000)
         return False
@@ -908,12 +976,17 @@ def _http_json(conn, code, obj):
 
 
 def http_api_handler(cfg, conn):
-    """HTTP 控制 API 路由（STA 模式下独立线程跑）
+    """HTTP 控制 API 路由。
 
-    v6.0.4：本函数运行在 HTTP 线程，**绝不能直接调用任何 publish_*()**。
+    v6.0.4：本函数曾运行在 HTTP 线程，**绝不能直接调用任何 publish_*()**。
     原因有两层：(1) 与主循环的 check_msg/ping 抢同一个 MQTT socket；
     (2) umqtt publish 内部会 wait_msg 读 socket，两个线程同时读会让 PUBACK
-    被错误的线程吃掉。统一改为置标志，由主循环消费后 publish。
+    被错误的线程吃掉。当时统一改为置标志，由主循环消费后 publish。
+
+    v6.0.5：HTTP 服务已整体搬进主循环（http_poll 非阻塞轮询，见该函数说明），
+    本函数现在**就在主循环线程里执行**，理论上可以直接 publish。但仍保留
+    report_requested 标志：publish 统一由主循环的同一条路径发起，便于
+    上报时序集中控制，也避免 handler 中途 publish 打乱本轮循环状态。
 
     路由：
     - GET /api/relay?ch=N&state=0/1  → 控制单路
@@ -974,11 +1047,34 @@ def http_api_handler(cfg, conn):
             "stall_cmds": stall_cmds,
             "force_reconnect": force_reconnect,
             "hb_timeout_s": hb_timeout_active_s,
+            # v6.0.5 HTTP 主循环轮询诊断（观察并发下是否出现 abort 激增/请求停摆）
+            "http_polls": _http_polls,
+            "http_reqs": _http_reqs,
+            "http_aborts": _http_aborts,
+            "http_open": _http_conn is not None,
+            # v6.0.5 自愈 D 诊断（isconnected 为真但数据面假死时的重新关联计数）
+            "mqtt_fails": mqtt_fail_streak,
+            "wifi_reassocs": wifi_reassocs,
+            "wifi_reassoc_ms": wifi_reassoc_ms,
+            # v6.0.5 自愈 E 诊断：MQTT 连续不可用秒数 / 已发起硬复位次数
+            "net_dead_s": (int(time.ticks_diff(now_ms(), net_dead_since) / 1000)
+                           if net_dead_since else 0),
+            "net_resets": net_resets,
         }
         try:
             if wlan_sta and wlan_sta.isconnected():
                 info["wifi_connected"] = True
                 info["ip"] = wlan_sta.ifconfig()[0]
+                # v6.0.5 链路质量诊断：「MQTT 建连 ECONNABORTED / ping 丢包」这类
+                # 现象绝大多数是 RSSI 太低（板子位置/AP 干扰），一眼定性省得乱猜代码。
+                try:
+                    info["wifi_rssi"] = wlan_sta.status("rssi")
+                except Exception:
+                    pass
+                try:
+                    info["wifi_status"] = wlan_sta.status()
+                except Exception:
+                    pass
         except Exception:
             pass
         _http_json(conn, "200 OK", info)
@@ -1126,134 +1222,280 @@ def _read_request(conn):
     return head, b"\r\n\r\n", rest
 
 
-def start_control_http(cfg):
-    """在 STA 模式下启独立 HTTP 控制 API（端口 80），用于局域网直连控制继电器
+# -------------------- v6.0.5 HTTP 服务（主循环非阻塞轮询） --------------------
+# 【2026-09-10 实板事故】/api/relay 并发 >=4 整机静默冻结（ARP 不答、串口停住、
+# 无 panic/复位，只能硬复位）。原因 = 旧 HTTP 独立线程与主循环并发操作 lwIP，
+# 且 C3 内部 RAM 只允许 4KB 线程栈。修复 = HTTP 回主线程单连接状态机。
+# 证据见 ROOTCAUSES.md 第 3 条。
+HTTP_READ_TIMEOUT_MS = 3000   # 单个连接的请求读超时（读不满即丢弃，防慢连接拖死）
+HTTP_FIRST_BYTE_TIMEOUT_MS = 1000  # 建连后首字节超时（半开连接 1s 内没数据即丢弃，
+                                   # 否则它会占着单连接状态机、把后面的正常请求堵住）
+HTTP_MAX_REQ_BYTES = 8192     # 单请求字节上限（防超大 body 撑爆 RAM）
+HTTP_RECV_CHUNK = 1024        # 每轮最多读入的字节数（保证主循环单轮开销极小）
+HTTP_LISTEN_BACKLOG = 8       # 监听队列长度（容忍突发并发；lwIP 每次连接仅占一个 PCB）
+HTTP_MAX_CONN_PER_POLL = 4    # 单轮最多处理的「已就绪」连接数（限住主循环单轮开销）
+EAGAIN_ERRNOS = (11, 10035)   # EAGAIN / EWOULDBLOCK（Windows 侧 WSAEWOULDBLOCK=10035）
 
-    用于 MQTT broker 下行不通时绕过 broker。线程驱动，不阻塞主循环。
+
+class _HttpPrebufferedConn(object):
+    """把「已读全的请求字节」伪装成 conn 交给 http_api_handler。
+
+    v6.0.5：请求由 http_poll() 在主循环里非阻塞读全后，一次性喂给 handler。
+    handler 内部仍会调 _read_request()，本包装让它：
+      - settimeout() 变 no-op（轮询模式下不允许阻塞读）
+      - recv() 只吐预读缓冲，耗尽后返回 b''（绝不阻塞、绝不碰真实 socket）
+    其余方法（send/close/...）透传给真实连接。
     """
-    if _thread is None:
-        print("[HTTP API] _thread not available, skip")
-        return
 
-    # 线程栈大小：MicroPython 里 stack_size 是"全局"设置，会传染给之后创建的
-    # 所有线程（含 Modbus worker）。且线程栈从 ESP-IDF 内部 RAM 分配（不是
-    # MicroPython GC heap！），C3 内部 RAM 大部分被 GC heap + WiFi/lwIP 划走，
-    # 实测 8KB/6KB 均分配失败（can't create thread），4KB 是上限（2026-09 REPL
-    # 逐档实测：8192 FAIL / 6144 FAIL / 4096 OK，mem_free 147KB 空闲也无效）。
+    def __init__(self, conn, prebuf):
+        self._conn = conn
+        self._buf = prebuf
+
+    def settimeout(self, t):
+        pass
+
+    def recv(self, n):
+        if not self._buf:
+            return b""
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+    def send(self, data):
+        # 连接是非阻塞的：响应很小（<1KB，远小于 socket 发送缓冲），正常一次
+        # 写完；万一遇到 EAGAIN 就短暂让出 CPU 重试（上限 ~200ms），避免
+        # "响应被静默丢弃"和"长时间占住主循环"两个极端。
+        sock = self._conn
+        total = len(data)
+        sent = 0
+        tries = 0
+        while sent < total:
+            try:
+                sent += sock.send(data[sent:])
+            except OSError as e:
+                eno = e.args[0] if e.args else None
+                if eno not in EAGAIN_ERRNOS:
+                    raise
+                tries += 1
+                if tries > 200:
+                    raise
+                try:
+                    time.sleep_ms(1)
+                except Exception:
+                    try:
+                        time.sleep(0.001)
+                    except Exception:
+                        pass
+        return sent
+
+    def close(self):
+        return self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _http_req_complete(buf):
+    """请求是否读全：head 结束标志 + content-length 对应 body 已到齐。"""
+    i = buf.find(b"\r\n\r\n")
+    if i < 0:
+        return False
+    clen = 0
+    for line in buf[:i].split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            try:
+                clen = int(line.split(b":", 1)[1].strip())
+            except Exception:
+                clen = 0
+            break
+    return len(buf) - (i + 4) >= clen
+
+
+def _http_abort():
+    """丢弃当前未完成的连接（半开 / 超时 / 超长）。"""
+    global _http_conn, _http_buf, _http_aborts
+    conn = _http_conn
+    _http_conn = None
+    _http_buf = b""
+    if conn is None:
+        return
+    _http_aborts += 1
     try:
-        _thread.stack_size(4 * 1024)
+        conn.close()
     except Exception:
         pass
 
-    # 全局引用监听 socket，防止 GC 在线程异常退出时回收它
-    global _http_srv, _http_stop
-    _http_srv = None
-    _http_stop = False  # 若上次 portal 切换置过 True，重启 HTTP 前必须复位
 
-    def _serve():
-        global _http_srv
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("0.0.0.0", 80))
-            srv.listen(3)
-            _http_srv = srv
-            print("[HTTP API] listening on port 80")
-        except Exception as e:
-            print("[HTTP API] bind error:", e)
-            return
-        # accept 每秒超时一次，轮询 _http_stop，保证 portal 切换前能干净退出
-        srv.settimeout(1)
-        while not _http_stop:
-            try:
-                conn, addr = srv.accept()
-            except OSError:
-                continue
-            except Exception:
-                continue
-            try:
-                http_api_handler(cfg, conn)
-            except Exception as e:
-                print("[HTTP API] handler error:", e)
-                try:
-                    http_send(conn, "500 Internal Server Error", "err: %s" % e)
-                except Exception:
-                    pass
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        # 被通知退出（portal 切换前）：关闭监听 socket 释放端口 80
+def stop_control_http():
+    """关闭 HTTP 监听 socket 与未完成连接（portal 切换前调用）。"""
+    global _http_srv, _http_stop
+    _http_stop = True
+    _http_abort()
+    srv = _http_srv
+    _http_srv = None
+    if srv is not None:
         try:
             srv.close()
         except Exception:
             pass
-        _http_srv = None
-        print("[HTTP API] server stopped")
+        print("[HTTP API] stopped")
 
+
+def http_poll(cfg):
+    """主循环调用的非阻塞 HTTP 服务（v6.0.5）。
+
+    设计要点（修复「/api/relay 并发 >=4 整机冻结」）：
+      - 所有 socket 操作都在主线程，不再与主循环的其他 lwIP 调用跨线程竞争；
+      - accept/recv 全非阻塞：单轮最多处理 HTTP_MAX_CONN_PER_POLL 个「已就绪」
+        连接，遇到没有新数据/队列为空就立刻收手，绝不阻塞主循环（MQTT 心跳、
+        Modbus 采集节奏不受影响）；
+      - 单连接状态机 + 3s 读超时 + 8KB 上限：慢连接/半开连接会被丢弃，
+        不会拖死监听队列或内存。
+    """
+    global _http_conn, _http_buf, _http_deadline_ms
+    global _http_polls, _http_reqs
+    _http_polls += 1
+    srv = _http_srv
+    if srv is None or _http_stop:
+        return
+
+    for _round in range(HTTP_MAX_CONN_PER_POLL):
+        now = now_ms()
+
+        if _http_conn is None:
+            try:
+                conn, _addr = srv.accept()
+            except OSError:
+                return                   # EAGAIN：监听队列为空，本轮结束
+            except Exception:
+                return
+            try:
+                conn.setblocking(False)
+            except Exception:
+                pass
+            _http_conn = conn
+            _http_buf = b""
+            _http_deadline_ms = time.ticks_add(now, HTTP_FIRST_BYTE_TIMEOUT_MS)
+
+        conn = _http_conn
+        try:
+            d = conn.recv(HTTP_RECV_CHUNK)
+        except OSError as e:
+            eno = e.args[0] if e.args else None
+            if eno in EAGAIN_ERRNOS:
+                d = None                 # 数据未到
+            else:
+                _http_abort()            # 连接已坏（RST 等）
+                continue
+        except Exception:
+            _http_abort()
+            continue
+
+        if d:
+            if not _http_buf:
+                # 首字节到了：把「首字节超时」换成完整请求的读超时
+                _http_deadline_ms = time.ticks_add(now, HTTP_READ_TIMEOUT_MS)
+            _http_buf += d
+
+        if d is None:
+            # 当前连接数据还没到：可能只是慢，收手等下一轮（不忙等）
+            if time.ticks_diff(now, _http_deadline_ms) >= 0:
+                _http_abort()            # 首字节超时 / 读超时
+            return
+        if d == b"" and not _http_req_complete(_http_buf):
+            _http_abort()                # 对端提前关闭且请求不全
+            continue
+
+        if not _http_req_complete(_http_buf):
+            if (len(_http_buf) > HTTP_MAX_REQ_BYTES
+                    or time.ticks_diff(now, _http_deadline_ms) >= 0):
+                _http_abort()
+                continue
+            return                       # 还需要更多数据，本轮结束
+
+        # 请求读全 -> 交路由处理；无论成败都关闭连接
+        view = _HttpPrebufferedConn(conn, _http_buf)
+        _http_conn = None
+        _http_buf = b""
+        _http_reqs += 1
+        try:
+            http_api_handler(cfg, view)
+        except Exception as e:
+            print("[HTTP API] handler error:", e)
+            try:
+                http_send(view, "500 Internal Server Error", "err: %s" % e)
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    # 达到本轮配额，剩余连接留到下一轮（保证主循环不会被 HTTP 独占）
+
+
+def start_control_http(cfg):
+    """在 STA 模式下启动 HTTP 控制 API（端口 80），用于局域网直连控制继电器。
+
+    v6.0.5：**不再创建独立线程**。改为只创建「非阻塞监听 socket」，由主循环
+    每轮调 http_poll() 串行处理连接（原因见上方 HTTP_* 常量处的详细说明）。
+
+    仍保留 _thread.stack_size(4*1024)：MicroPython 里 stack_size 是全局设置，
+    对之后创建的所有线程生效；紧随其后的 Modbus worker 线程仍依赖它。
+    （C3 实测：8192/6144 均 can't create thread，4096 是上限。）
+    """
+    global _http_srv, _http_stop
+    if _thread is not None:
+        try:
+            _thread.stack_size(4 * 1024)
+        except Exception:
+            pass
+    _http_stop = False
+    _http_srv = None
     try:
-        import gc
-        gc.collect()  # 回收碎片再分配线程栈，降低 can't create thread 概率
-        _thread.start_new_thread(_serve, ())
-        print("[HTTP API] thread started")
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", 80))
+        srv.listen(HTTP_LISTEN_BACKLOG)
+        srv.setblocking(False)
+        _http_srv = srv
+        print("[HTTP API] listening on port 80 (main-loop polled, non-blocking)")
     except Exception as e:
-        print("[HTTP API] thread fail:", e)
+        _http_srv = None
+        print("[HTTP API] bind error:", e)
 
 
 def portal(cfg):
     """进入 AP 配网模式
 
-    必须在无其他线程持有网络资源时切换：STA HTTP 线程与主线程并发操作
-    lwIP 会触发 Guru Meditation (Load access fault) 崩溃重启，导致热点
-    一闪而逝。顺序：停 HTTP 线程 -> 断 MQTT -> 全关继电器 -> 停 Modbus
-    -> 关 STA -> 开 AP。
+    必须在无其他线程持有网络资源时切换，否则 STA/AP 切换会触发
+    Guru Meditation (Load access fault) 崩溃重启、热点一闪而逝。
+    顺序：停 HTTP -> 断 MQTT -> 全关继电器 -> 停 Modbus -> 关 STA -> 开 AP。
     """
-    global client, _http_stop
-    # 0) WiFi 失败风暴守卫（必须在一切 esp_wifi / lwIP 操作之前，且只用纯 Python
-    #    标志判断，不再调用 status()/isconnected()）：
-    #    esp-sha 分配失败风暴(202/203/超时)后驱动进入坏状态，任何 esp_wifi
-    #    模式切换都会触发同址 Load access fault @0x420f8b0e Guru Meditation
-    #    （2026-09 实机：teardown 全跳过、纯等 8s 后仍崩在 AP active/deepsleep
-    #    —— 该址即 esp_wifi stop 路径）。带病开 AP 必崩，deepleep 调 esp_wifi_stop
-    #    同样可能崩。唯一不碰驱动的重启是 machine.reset()（直接 esp_restart，
-    #    不经 esp_wifi_stop）；MicroPython boot 会重新 esp_wifi_init，驱动全新。
-    #    实测 v5.4.1 A/B 软复位一次即连上 —— 软复位后驱动干净，连不上纯属
-    #    当时环境/射频干扰（esp-sha 分配失败）。故失败风暴 -> 复位重试循环，
-    #    直到环境恢复；复位周期约 20s，无崩溃刷屏。无 WiFi 配置(首配)时从未
-    #    真正发起连接，不视为失败，正常开 AP 供配网。
+    global client
+    # 0) WiFi 失败风暴守卫（须在一切 esp_wifi/lwIP 操作之前，只用纯 Python 标志
+    #    判断，不调 status()/isconnected()）：esp-sha 风暴后驱动进入坏状态，任何
+    #    esp_wifi 模式切换都会撞同址 Load access fault。machine.reset() 直接
+    #    esp_restart、不经 esp_wifi_stop，是唯一不碰驱动的重启；故风暴 -> 复位
+    #    重试循环。无配置(首配)时从未真正连过，不算失败，正常开 AP。见 ROOTCAUSES 2。
     if cfg.get("wifi_ssid") and _wifi_failed_this_boot and not _sta_connected_once:
         print("[portal] wifi fail storm this boot -> soft reset retry (streak=%d)" % _wifi_fail_streak)
         time.sleep(1)
         reset()
         return
-    # 1) 通知 HTTP 控制线程退出（accept 1s 超时轮询 _http_stop），释放端口 80。
-    #    注意：经 flag 软复位的干净路径此时 _http_srv 必为 None，直接跳过等待。
-    _http_stop = True
-    if _http_srv is not None:
-        try:
-            _http_srv.close()
-        except Exception:
-            pass
-        time.sleep(1.5)
+    # 1) 关闭 HTTP 监听 socket 释放端口 80。v6.0.5 起 HTTP 在主循环轮询，没有
+    #    独立线程要等退出，主线程关掉监听即释放（SO_REUSEADDR 防 TIME_WAIT）。
+    stop_control_http()
     # 2) 断开 MQTT（幂等）
     mqtt_disconnect()
     # 3) 上电安全：继电器全部断开
     set_all_relay(False)
     # 4) 停止 Modbus 采集线程
     stop_modbus()
-    # 5) 断开并关闭 STA。只在本进程曾 active(True) 过 STA 时才触碰 esp_wifi：
-    #    干净 flag-boot / 无配置路径从未启动过 STA，直接 disconnect()/active(False)
-    #    会让 MicroPython 在未初始化的 esp_wifi 上执行原生调用，触发
-    #    Load access fault (MEPC 0x420f8b0e) Guru Meditation 硬崩溃
-    #    （try/except 拦不住硬件 fault，此前热点"一闪而逝"即因此）。
+    # 5) 断开并关闭 STA。只在本进程曾 active(True) 过 STA 时才触碰 esp_wifi，
+    #    且只在当前已连接时 teardown —— 未启动过的接口 / 失败态滞留 1001/39 时
+    #    调 disconnect()/active(False) 会 Load access fault 硬崩溃（拦不住）。
     if _sta_was_active:
-        # 只在 STA "当前已连接"时才做 teardown —— 这是运行中长按/HTTP 进入
-        # portal 的正常路径（v5.2 实机验证稳定）。WiFi 连接失败/超时兜底进来
-        # 的路径（connect_wifi 已返回 False）STA 从未连上，反复失败后驱动可能
-        # 滞留 1001(connecting)/39(怪异) 等状态，此时 disconnect()/active(False)
-        # 会触发 Load access fault @0x420f8b0e 硬崩溃（try/except 拦不住）。
-        # 失败/未知态一律跳过收尾：STA 已断开是惰性的，与 AP 并发无碍。
         _teardown = False
         try:
             _teardown = bool(wlan_sta.isconnected())
@@ -1394,10 +1636,9 @@ def connect_wifi(cfg):
     while not wlan_sta.isconnected():
         _now2 = now_ms()
         # === 驱动自愈观察窗（esp-sha 瞬时内存压力）===
-        # 2026-09-09 REPL 实证：模拟 main.py 内存压力下单次 connect 后，驱动
-        # 内部会自行重试握手，esp-sha buffer 分配失败可刷屏数十秒后最终连上，
-        # 前提是不 disconnect 打断它。收到失败码后先静默观察 FAIL_SETTLE_MS，
-        # 期间只轮询 isconnected，不重发不断开；窗口耗尽仍未连上才允许重置。
+        # 收到失败码后先静默观察 FAIL_SETTLE_MS：驱动内部会自行重试握手
+        # （esp-sha buffer 分配失败可刷屏数十秒后最终连上），前提是不 disconnect
+        # 打断它。期间只轮询 isconnected，窗口耗尽仍未连上才允许重置。
         if _fail_seen is not None and \
                 time.ticks_diff(_now2, _fail_seen) < FAIL_SETTLE_MS:
             for _ in range(6):
@@ -1426,9 +1667,8 @@ def connect_wifi(cfg):
             _wifi_fail_streak += 1
             _wifi_failed_this_boot = True
             # 超时返回前把驱动收尾到空闲：若仍卡在 connecting(1001) 就直接进
-            # portal()，那里对"连接中"的 STA 做 disconnect/active(False) 会
-            # 触发 Load access fault (MEPC 0x420f8b0e) Guru Meditation 硬崩溃。
-            # 先等最多 8s 落定——若迟到连上则直接返回成功，否则 disconnect 中止。
+            # portal()，那里对"连接中"的 STA 做 disconnect/active(False) 会硬崩溃。
+            # 先等最多 8s 落定——若迟到连上则返回成功，否则 disconnect 中止。
             _settle = now_ms()
             while not wlan_sta.isconnected() and wlan_sta.status() == 1001 \
                     and time.ticks_diff(now_ms(), _settle) < 8000:
@@ -1576,6 +1816,94 @@ def stop_modbus():
         mb_master = None
 
 
+def wifi_reassoc_if_dead(cfg, now):
+    """v6.0.5 自愈 D：WiFi 自称已连接但数据面已死时，主动重新关联。
+
+    只在「isconnected() 为 True」时介入 —— 真断线走主循环原有的重连分支。
+    返回 True 表示本次触发了重新关联。
+    """
+    global mqtt_fail_streak, wifi_reassocs, wifi_reassoc_ms, mqtt_retry
+    if mqtt_fail_streak < MQTT_FAIL_REASSOC:
+        return False
+    # v6.0.5 修正：初值必须是 None 而非 0。0 会被当成真实时间戳，
+    # ticks_diff(now,0) 在开机 90s 内恒 < 冷却值 -> 首次自愈被误挡（实测
+    # streak 累积到 9 才触发，阈值只有 3）。
+    if wifi_reassoc_ms is not None and \
+            time.ticks_diff(now, wifi_reassoc_ms) < WIFI_REASSOC_COOLDOWN_MS:
+        return False
+    try:
+        if not wlan_sta.isconnected():
+            return False        # 真断线：交给原有 WiFi 重连分支，这里不插手
+        st = wlan_sta.status()
+    except Exception as e:
+        print("[wifi] reassoc status err:", e)
+        return False
+
+    print("[wifi] data path dead: %d consecutive MQTT connect failures, "
+          "isconnected=True status=%s -> re-associate" % (mqtt_fail_streak, st))
+    try:
+        wlan_sta.disconnect()
+    except Exception as e:
+        print("[wifi] reassoc disconnect err:", e)
+    time.sleep(2)               # 等驱动回到可发起状态
+    # 驱动偶尔仍处于 "sta is connecting" 收尾窗口，直接 connect 会被拒。
+    # 这里重试两次（间隔 1s），比丢给 90s 冷却再等一轮强得多。
+    for _try in (1, 2):
+        try:
+            wlan_sta.connect(cfg["wifi_ssid"], cfg["wifi_password"])
+            break
+        except Exception as e:
+            print("[wifi] reassoc connect err (try%d):" % _try, e)
+            time.sleep(1)
+    wifi_reassocs += 1
+    wifi_reassoc_ms = now_ms()
+    mqtt_fail_streak = 0
+    mqtt_retry = 0              # 立刻重试 MQTT，尽快验证链路是否真的活了
+    return True
+
+
+def net_dead_track(now, mqtt_ok):
+    """维护「MQTT 连续不可用」时长（秒），供自愈 E 复位判据使用。
+
+    mqtt_ok=True 表示此刻 MQTT 可用（client 非 None）。用「MQTT 能否连上」这一个
+    信号统一表达"网络可用吗"——同时覆盖 isconnected() 真但数据面假死、以及
+    isconnected() 为假两种情形。
+    """
+    global net_dead_since, net_dead_base_reassocs
+    if mqtt_ok:
+        net_dead_since = 0
+        return 0
+    if not _sta_connected_once:
+        return 0                 # 从未连上过：冷启动问题，交给 portal 的失败风暴守卫
+    if net_dead_since == 0:
+        net_dead_since = now
+        net_dead_base_reassocs = wifi_reassocs   # 记下基线：本轮捅了几次从零算
+    return time.ticks_diff(now, net_dead_since) // 1000
+
+
+def net_reset_if_hopeless(cfg, now):
+    """自愈 E：网络彻底不可用（捅了几次都没救回来）-> 硬复位。
+
+    返回 True 表示已发起复位（调用方应立刻 continue）。machine.reset() 不走
+    esp_wifi_stop，复位后 boot.py/wifi_boot.py 在空堆重新预连（v6.0.1 实证最稳）。
+    """
+    global net_resets
+    if not _sta_connected_once or net_dead_since == 0:
+        return False
+    dead_s = time.ticks_diff(now, net_dead_since) // 1000
+    if dead_s * 1000 < NET_RESET_AFTER_MS:
+        return False
+    if wifi_reassocs - net_dead_base_reassocs < NET_RESET_MIN_REASSOCS:
+        return False
+    print("[net] unusable %ds (reassocs_this_round=%d mqtt_fails=%d) "
+          "-> HARD RESET to boot pre-connect"
+          % (dead_s, wifi_reassocs - net_dead_base_reassocs, mqtt_fail_streak))
+    net_resets += 1
+    time.sleep(0.3)
+    reset()
+    return True
+
+
 def run_normal(cfg):
     global client, last_ping, last_report, mqtt_retry, wifi_retry, long_triggered, portal_requested, short_requested, sw_short_requested, mb_master, _http_stop
     global pub_fail_streak, hb_timeout_active_s, force_reconnect, report_requested
@@ -1583,9 +1911,9 @@ def run_normal(cfg):
     if not connect_wifi(cfg):
         return False
 
-    # 先启 HTTP（8KB 线程栈需连续内部 RAM，须在堆最宽松时分配——实测晚于
-    # Modbus 线程创建会 can't create thread），再启 Modbus（worker 自带 2s
-    # 错峰延迟，不会抢初始化窗口）。
+    # v6.0.5：先建 HTTP 非阻塞监听 socket（主循环轮询，不再开线程），再启
+    # Modbus worker。start_control_http 里仍会设 _thread.stack_size(4KB)，
+    # 好让随后的 Modbus 线程能在 C3 的内部 RAM 上限内创建成功。
     start_control_http(cfg)
     # Modbus 采集线程（TCP/RTU 二选一，独立线程不阻塞继电器主循环）
     start_modbus(cfg)
@@ -1608,6 +1936,11 @@ def run_normal(cfg):
     while True:
         now = now_ms()
 
+        # v6.0.5：HTTP 控制 API 在主循环里非阻塞轮询（取代原独立线程）。
+        # 放在循环最顶部：无论走哪个 continue 分支（WiFi/MQTT 断开等），
+        # 每轮都会给 HTTP 一次机会，保证并发下请求不会饿死。
+        http_poll(cfg)
+
         # 检查 SW1 / SW 按键
         handle_button(cfg)
         handle_sw_button(cfg)
@@ -1629,7 +1962,8 @@ def run_normal(cfg):
             except Exception as e:
                 print("[SW] SW short press publish err:", e)
         if report_requested:
-            # v6.0.4：HTTP /api/relay 触发的补报（HTTP 线程只置标志，不碰 socket）
+            # v6.0.4：HTTP /api/relay 触发的补报（当时 HTTP 在独立线程，只置标志
+            # 不碰 socket）。v6.0.5 HTTP 已回到主循环，这条统一上报路径保留不变。
             report_requested = False
             try:
                 publish_property(cfg)
@@ -1640,10 +1974,10 @@ def run_normal(cfg):
             long_triggered = False
             portal_requested = False
             print("SW1 long press -> portal (arm soft-reset flag)")
-            # STA 热切换进 AP 时，HTTP / Modbus worker 等多线程持有网络/串口资源，
-            # 与主线程并发切换 WiFi 会触发 lwIP Load access fault 崩溃（热点一闪而逝）。
-            # 规避方案：写一次性标志文件后软复位，上电在无线程的干净环境直接进 portal。
-            _http_stop = True  # 通知 HTTP 线程退出（尽力而为，复位后自然消失）
+            # STA 热切进 AP 时多线程持有网络资源，与主线程并发切换 WiFi 会
+            # lwIP Load access fault 崩溃（热点一闪而逝）。故写一次性标志文件
+            # 后软复位，上电在无线程的干净环境直接进 portal。
+            _http_stop = True  # 尽力而为：复位后自然消失（真正释放靠 machine.reset）
             try:
                 with open(PORTAL_FLAG, "w") as _f:
                     _f.write("1")
@@ -1651,6 +1985,14 @@ def run_normal(cfg):
                 print("[BUTTON] write portal flag err:", _e)
             time.sleep(0.3)
             reset()
+
+        # v6.0.5 自愈 E：跟踪「MQTT 连续不可用」时长，捅几次还不行就硬复位。放这里
+        # （WiFi 分支之前）是刻意的：无论 isconnected() 真假每轮都评估一次 ——
+        # 「自愈 D 捅完停在 IDLE」的死局走的是下面的 WiFi 分支，到不了 MQTT 分支。
+        _net_dead_s = net_dead_track(now, client is not None)
+        if _net_dead_s:
+            if net_reset_if_hopeless(cfg, now):
+                continue
 
         # WiFi 断线重连
         if not wlan_sta.isconnected():
@@ -1660,8 +2002,10 @@ def run_normal(cfg):
                 print("WiFi lost, retrying...")
                 try:
                     wlan_sta.connect(cfg["wifi_ssid"], cfg["wifi_password"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    # "sta is connecting" 是驱动连接中的正常拒绝，下周期再试；
+                    # 其它错误别无声吞掉——它是排查"卡在 IDLE"的唯一线索。
+                    print("WiFi retry err:", e)
             time.sleep(0.2)
             continue
 
@@ -1672,6 +2016,11 @@ def run_normal(cfg):
                 mqtt_retry = time.ticks_add(now, RETRY_S * 1000)
                 print("MQTT retry...")
                 mqtt_connect(cfg)
+                # v6.0.5 自愈 D：建连仍失败 + WiFi 自称已连接 -> 数据面可能假死。
+                # 这是「isconnected() 为真但收发包全丢」的唯一出口，没有它板子
+                # 会永远卡在 MQTT 重试里（实板症状：ECONNABORTED 死循环）。
+                if client is None:
+                    wifi_reassoc_if_dead(cfg, now)
         else:
             try:
                 client.check_msg()
@@ -1713,7 +2062,11 @@ def run_normal(cfg):
                 mqtt_retry = time.ticks_add(now, RETRY_S * 1000)
                 led_set(False)
 
-        time.sleep(0.1)
+        # v6.0.5：HTTP 是「单连接状态机」，而 http_poll() 遇到「数据未到」会提前
+        # return —— 于是每个连接至少要跨 2 轮主循环。若仍按 0.1s 睡，吞吐会被压到
+        # ~5 连接/秒：实板 n=32 时监听队列持续溢出，客户端 SYN 重传直到 12s 超时。
+        # 有连接在途时把间隔压到 20ms（无连接时保持 0.1s，不额外费电）。
+        time.sleep(0.02 if _http_conn is not None else 0.1)
 
 
 # -------------------- 按键处理 --------------------
