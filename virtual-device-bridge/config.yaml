@@ -156,10 +156,24 @@ relays:
 #   2) 通配前缀：s1_* 表示把从站 1 所有 key 映射到同一子设备
 sensors:
   # 真实 Modbus 从站 1（温湿度）
+  # 2026-09-11 实测（MQTT 监听抓包）：板子上报键为 temperature / humidity（无 s1_ 前缀），
+  # 导致旧的 s1_* 通配映射匹配不上、th-001-lfx 长时间无数据。现按精确条目接住无前缀键，
+  # 并保留 s1_* 通配条目兼容带前缀的键风格（两种都归一到同一子设备）。
   - product_id: "th-lfx"
     device_id: "th-001-lfx"
-    name: "温湿度传感器"
-    # 把父设备里的 s1_temperature / s1_humidity 等转发到本设备
+    name: "温湿度传感器(温度)"
+    source_pattern: "temperature"
+    property_map:
+      temperature: temperature
+  - product_id: "th-lfx"
+    device_id: "th-001-lfx"
+    name: "温湿度传感器(湿度)"
+    source_pattern: "humidity"
+    property_map:
+      humidity: humidity
+  - product_id: "th-lfx"
+    device_id: "th-001-lfx"
+    name: "温湿度传感器(带前缀兼容)"
     source_pattern: "s1_*"
     property_map:
       s1_temperature: temperature
