@@ -1,10 +1,18 @@
 # 4 路继电器 + Modbus TCP/RTU 采集网关（MicroPython / ESP32-C3）
 
+当前版本：**v6.0.5**（2026-09-10）
+
 固件文件：
-- `main.py`：主程序（配网、WiFi、MQTT、继电器、Modbus 线程调度）
+- `main.py`：主程序源码（配网、WiFi、MQTT、继电器、HTTP API、Modbus 调度、自愈）
+- `main_entry.py`：板上 `/main.py` 的引导壳，负责加载 `.mpy` 产物
+- `app_main.mpy`：**板上实际运行的字节码**（由 `main.py` 预编译而来）
+- `build_mpy.py` / `deploy.py`：打包与一键部署工具（详见文末「构建与部署」）
 - `modbus_tcp_master.py`：Modbus TCP 主站，独立线程运行，不阻塞继电器
 - `modbus_master.py`：Modbus RTU 主站（保留，mode=rtu 时启用）
 - `portal_page.html`：AP 配网 Web 页面（部署到设备上为 `portal.html`）
+- `portal_preview.html` / `gen_preview.py`：本地预览配网页，不用上板
+- `verify_board.py`：实板验收脚本（见文末「实板验收」）
+- `boot.py` / `wifi_boot.py`：启动阶段空堆预连 WiFi
 
 ## 功能特性
 
@@ -220,3 +228,66 @@ python -m mpremote connect COMx fs cp "D:\8-relay\esp32-relay4-modbus-gateway\po
 
 - 电压/电流/功率为占位值（真实硬件如无传感器则按固定负载模拟）。
 - 若多个从站配置了相同的 `key`，属性上报中会发生覆盖，请确保同一产品下属性名唯一或加入从站前缀区分。
+
+---
+
+## 构建与部署（v6.0.5 起）
+
+### 为什么需要预编译
+
+板上跑的不是 `main.py` 源码，而是 `app_main.mpy`。原因是 `pyexec_file` 加载源码时
+**源码字符串 + 解析树 + 字节码会同时驻留内存（约等于源码体积的 2 倍）**；C3 预连 WiFi 后
+可用堆约 158 KB，于是源码直编的上限只有 **~80 KB**，再大就 `MemoryError`
+（而且报错可能是「1768 B 分配失败」这种小数字，容易误判成内存碎片）。
+
+改用 `mpy-cross` 预编译后，27 KB 的 `.mpy` 加载仅占约 40 KB，余量近 4 倍，体积约束解除。
+
+> 工具链必须与板子固件版本严格对齐：板子跑 MicroPython **v1.24.0**，
+> 对应的 `mpy-cross` 是 **1.24.0.post2**（mpy 版本 v6.3，头字节 `4d 06`）。
+> 版本不匹配会直接 `ValueError: incompatible .mpy file`。
+
+### ⚠️ 改完源码必须走 deploy.py
+
+```bash
+python esp32-relay4-modbus-gateway/deploy.py                 # 构建 + 上传（推荐）
+python esp32-relay4-modbus-gateway/deploy.py --skip-build    # 我明确知道要跳过构建
+python esp32-relay4-modbus-gateway/deploy.py --no-reset      # 上传后不复位
+```
+
+**不要只上传文件跳过构建**——`.mpy` 是预编译产物，源码改了但产物没重建的话，
+板子会继续跑旧逻辑，而且日志一切正常，极难排查。`deploy.py` 内置了
+「`app_main.mpy` 的 mtime 早于 `main.py` 就硬失败」的守卫，别绕过它。
+
+### 实板验收
+
+```bash
+python esp32-relay4-modbus-gateway/verify_board.py            # 12 项断言
+python esp32-relay4-modbus-gateway/verify_board.py --serial   # 附带串口日志（落盘 verify_board_serial.log）
+```
+
+`verify_board.py` 验证的是 v6.0.5 修掉的那个缺陷：**`/api/relay` 并发 ≥4 时整机永久冻结**
+（ARP 不答、串口停住、无 panic 无复位、ping/HTTP 全 timeout，只能 esptool 硬复位）。
+
+判据：
+1. 并发阶梯 `1/2/4/8/16/32` **全部返回 200**，且每一级之后板子**立刻还活着**；
+2. `/api/info` 暴露 `http_polls` / `http_reqs` 且随请求增长（证明真走主循环轮询，
+   而不是旧线程模型换了个壳）；
+3. 洪泛期间与之后，父设备 `property/post` 不断流（最大间隔有界）；
+4. 下行 `set_channel` 真实生效、出站 qos 全 0、`mqtt_connects` 不增长。
+
+> **排障铁律**：`timeout` = 整机冻结（是真缺陷）；**立刻或延迟收到 RST 则是
+> lwIP PCB 池（C3 只有 16 条 active TCP）的容量拒绝**，属于正常保护。
+> 两者必须分开判断，别把容量拒绝当成回归。
+
+## 版本历史（近期）
+
+| 标签 | 说明 |
+|---|---|
+| `v6.0.5-http-poll-freeze-fix` | HTTP API 搬回主循环非阻塞轮询，修并发冻结；WiFi 假死自愈；MQTT 建连前 TCP 预检；引入 `.mpy` 打包链路 |
+| `v6.0.4-mqtt-puback-deadlock-fix` | 出站全部改 `PUB_QOS=0`，规避 umqtt `publish(qos=1)` 嵌套 PUBACK 死锁 |
+| `v6.0.1-boot-wifi-preconnect` | `boot.py` + `wifi_boot.py` 空堆预连 WiFi，修 esp-sha 永久饥饿 |
+| `v6.0-modbus-tcp-gateway` | 新增 Modbus TCP 主站模式 |
+| `v5.0-final-complete` | 需求完成里程碑，回滚锚点 |
+
+完整标签见仓库根目录 `README.md`，或在 `esp32-relay4-modbus-gateway/` 下执行 `git tag`。
+
