@@ -1,0 +1,130 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-09-11 10:09:26",
+  "relay_groups": [
+    {
+      "id": "relay8_lfx",
+      "name": "8路继电器-lfx",
+      "product_id": "relay8_lfx",
+      "device_id": "RELAY8-TERM-01",
+      "broker": {
+        "host": "172.16.4.211",
+        "port": 9783,
+        "username": "test",
+        "password": "123456"
+      },
+      "command": {
+        "method": "write",
+        "topic_template": "/{product_id}/{device_id}/service/cmd"
+      },
+      "channels": [
+        {
+          "ch": 1,
+          "attr": "r1",
+          "name": "开关1",
+          "enabled": true
+        },
+        {
+          "ch": 2,
+          "attr": "r2",
+          "name": "开关2",
+          "enabled": true
+        },
+        {
+          "ch": 3,
+          "attr": "r3",
+          "name": "开关3",
+          "enabled": true
+        },
+        {
+          "ch": 4,
+          "attr": "r4",
+          "name": "开关4",
+          "enabled": true
+        },
+        {
+          "ch": 5,
+          "attr": "r5",
+          "name": "开关5",
+          "enabled": true
+        },
+        {
+          "ch": 6,
+          "attr": "r6",
+          "name": "开关6",
+          "enabled": true
+        },
+        {
+          "ch": 7,
+          "attr": "r7",
+          "name": "开关7",
+          "enabled": true
+        },
+        {
+          "ch": 8,
+          "attr": "r8",
+          "name": "开关8",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "relay4_lfx",
+      "name": "4路继电器-lfx（ESP32-C3 实板）",
+      "product_id": "relay4_lfx",
+      "device_id": "7ce8b1c1a7fc",
+      "broker": {
+        "host": "172.16.4.211",
+        "port": 9783,
+        "username": "test",
+        "password": "123456"
+      },
+      "command": {
+        "method": "write",
+        "topic_template": "/{product_id}/{device_id}/service/cmd"
+      },
+      "channels": [
+        {
+          "ch": 1,
+          "attr": "r1",
+          "name": "继电器1",
+          "enabled": true
+        },
+        {
+          "ch": 2,
+          "attr": "r2",
+          "name": "继电器2",
+          "enabled": true
+        },
+        {
+          "ch": 3,
+          "attr": "r3",
+          "name": "继电器3",
+          "enabled": true
+        },
+        {
+          "ch": 4,
+          "attr": "r4",
+          "name": "继电器4",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "modbus_sensors": [
+    {
+      "id": "modbus-th-01",
+      "name": "Modbus温湿度传感器",
+      "device_id": "MODBUS-TERM-01",
+      "product_id": "mqtt-iot",
+      "slave_ip": "192.168.20.59",
+      "slave_port": 5502,
+      "slave_id": 1,
+      "register_addr": "0x0005",
+      "temperature_field": "temperature",
+      "humidity_field": "humidity",
+      "report_interval": 5,
+      "enabled": true
+    }
+  ]
+}
